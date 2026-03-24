@@ -73,6 +73,14 @@ curl -k -X POST http://dmz_key_bot.domain.ru:443/ \
   }'
 ```
 
+#### Сертификаты
+
+Самоподписанные делаем и в  настрйоках бота снимает галки, либо подписывайте своим СА.
+
+```
+openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes -subj "/CN=dmz_key_bot.domain.ru"
+```
+
 <img src="https://github.com/oditynet/express-dmz-bot/blob/main/res1.png" title="example" width="800" />
 
 #### Service systemd
