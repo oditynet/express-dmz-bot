@@ -18,6 +18,8 @@ Bot for DMZ key to express.ms
 
 Перед запуском заполняем файл
 
+#### Config
+
 ```
 cat .env
 EXPRESS_DOMAIN=https://express.domain.ru
@@ -29,6 +31,14 @@ DB_PATH=dmzkeyroom.db
 ```
 
 Создаем группу и туда добавляем бота (у нас так)
+
+
+#### Build and run
+```
+go build -o main main.go
+./main
+```
+#### Test
 
 Проверяем доступ к боту:
 
