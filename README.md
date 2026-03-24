@@ -14,6 +14,8 @@
 
 Бот для нашего ДМЗ ключа который работает на express.ms
 
+ <a href="https://github.com/oditynet/telegrambot_DMZkeyroom" >Аналог telegrambot_DMZkeyroom</a>
+
 Возможности: отправка статуса ключа в личных сообщениях в групповом чате. 
 
 Нюанс получения ответа от бота:
