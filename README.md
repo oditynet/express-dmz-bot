@@ -72,3 +72,23 @@ curl -k -X POST http://dmz_key_bot.domain.ru:443/ \
 ```
 
 <img src="https://github.com/oditynet/express-dmz-bot/blob/main/res1.png" title="example" width="800" />
+
+#### Service systemd
+vim /etc/systemd/system/express-bot.service
+```
+[Unit]
+Description=Express DMZ Key Room Bot
+After=network.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/home/user
+ExecStart=/home/user/main
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
