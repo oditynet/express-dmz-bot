@@ -1,4 +1,5 @@
-//version 0.1 alpha
+//version 0.2 alpha
+
 package main
 
 import (
@@ -151,7 +152,7 @@ func GetToken() (string, error) {
 		return tokenManager.token, nil
 	}
 
-	log.Println("🔄 Обновление токена...")
+	log.Println("Обновление токена...")
 	newToken, err := fetchNewToken()
 	if err != nil {
 		return "", err
@@ -159,7 +160,7 @@ func GetToken() (string, error) {
 
 	tokenManager.token = newToken
 	tokenManager.expiresAt = time.Now().Add(14 * time.Minute)
-	log.Printf("✅ Токен обновлен! Действует до: %s", tokenManager.expiresAt.Format("15:04:05"))
+	log.Printf("Токен обновлен! Действует до: %s", tokenManager.expiresAt.Format("15:04:05"))
 	return newToken, nil
 }
 
@@ -167,17 +168,17 @@ func startTokenRefresher() {
 	ticker := time.NewTicker(14 * time.Minute)
 	go func() {
 		for range ticker.C {
-			log.Println("🔄 Плановое обновление токена...")
+			log.Println("Плановое обновление токена...")
 			newToken, err := fetchNewToken()
 			if err != nil {
-				log.Printf("❌ Ошибка обновления: %v", err)
+				log.Printf(" Ошибка обновления: %v", err)
 				continue
 			}
 			tokenManager.mu.Lock()
 			tokenManager.token = newToken
 			tokenManager.expiresAt = time.Now().Add(14 * time.Minute)
 			tokenManager.mu.Unlock()
-			log.Println("✅ Токен обновлен")
+			log.Println("Токен обновлен")
 		}
 	}()
 }
@@ -191,6 +192,7 @@ func initDB() error {
 		return err
 	}
 
+	// Таблица статуса ключа
 	_, err = db.Exec(`
 		CREATE TABLE IF NOT EXISTS key_status (
 			id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -202,6 +204,7 @@ func initDB() error {
 		return err
 	}
 
+	// Таблица истории
 	_, err = db.Exec(`
 		CREATE TABLE IF NOT EXISTS history (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -217,6 +220,22 @@ func initDB() error {
 		return err
 	}
 
+	// НОВАЯ ТАБЛИЦА для согласия на обработку ПД
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS user_consent (
+			user_huid TEXT PRIMARY KEY,
+			user_name TEXT NOT NULL,
+			consent_status INTEGER NOT NULL DEFAULT 0,
+			consent_date TIMESTAMP,
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+		)
+	`)
+	if err != nil {
+		return err
+	}
+
+	// Проверка и создание записи по умолчанию для key_status
 	var count int
 	err = db.QueryRow("SELECT COUNT(*) FROM key_status").Scan(&count)
 	if err != nil {
@@ -230,10 +249,10 @@ func initDB() error {
 		if err != nil {
 			return err
 		}
-		log.Println("✅ Создана запись статуса по умолчанию (status=0)")
+		log.Println("Создана запись статуса по умолчанию (status=0)")
 	}
 
-	log.Println("✅ База данных инициализирована")
+	log.Println("База данных инициализирована")
 	return nil
 }
 
@@ -266,6 +285,7 @@ func AddHistory(status int, userHUID, userName, phone, message string) {
 		log.Printf("Ошибка добавления истории: %v", err)
 	}
 
+	// Оставляем только последние 8 записей
 	_, err = db.Exec(`
 		DELETE FROM history WHERE id NOT IN (
 			SELECT id FROM history ORDER BY timestamp DESC LIMIT 8
@@ -305,6 +325,121 @@ func GetHistory() ([]map[string]string, error) {
 		})
 	}
 	return history, nil
+}
+
+// ============= УПРАВЛЕНИЕ СОГЛАСИЕМ =============
+
+// GetUserConsent - получить статус согласия пользователя
+func GetUserConsent(userHUID string) (int, error) {
+	var consentStatus int
+	err := db.QueryRow("SELECT consent_status FROM user_consent WHERE user_huid = ?", userHUID).Scan(&consentStatus)
+	if err == sql.ErrNoRows {
+		return 0, nil // Пользователь не найден - считаем что не согласен
+	}
+	if err != nil {
+		return 0, err
+	}
+	return consentStatus, nil
+}
+
+// SetUserConsent - установить статус согласия пользователя
+func SetUserConsent(userHUID, userName string, consentStatus int) error {
+	now := time.Now().Format("2006-01-02 15:04:05")
+	
+	var consentDate interface{}
+	if consentStatus == 1 {
+		consentDate = now
+	} else {
+		consentDate = nil
+	}
+	
+	// Используем INSERT OR REPLACE для обновления или вставки
+	_, err := db.Exec(`
+		INSERT INTO user_consent (user_huid, user_name, consent_status, consent_date, updated_at)
+		VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(user_huid) DO UPDATE SET
+			user_name = excluded.user_name,
+			consent_status = excluded.consent_status,
+			consent_date = excluded.consent_date,
+			updated_at = excluded.updated_at
+	`, userHUID, userName, consentStatus, consentDate, now)
+	
+	if err != nil {
+		log.Printf("Ошибка сохранения согласия: %v", err)
+		return err
+	}
+	
+	log.Printf("Пользователь %s (%s) статус согласия: %d", userName, userHUID, consentStatus)
+	return nil
+}
+
+// SendConsentRequest - отправить запрос на согласие
+func SendConsentRequest(chatID, userHUID string) error {
+	token, err := GetToken()
+	if err != nil {
+		return err
+	}
+	
+	// Кнопки для согласия
+	buttons := [][]Button{
+		{
+			{Command: "/consent_yes", Label: "✅ Согласен", HSize: 6},
+			{Command: "/consent_no", Label: "❌ Не согласен", HSize: 6},
+		},
+	}
+	
+	message := `*Согласие на обработку персональных данных*
+
+В соответствии с Федеральным законом № 152-ФЗ "О персональных данных" информируем вас, что:
+
+• Ваши персональные данные (ФИО, номер телефона, HUID) будут обрабатываться
+• Данные хранятся в защищенной базе данных
+• Цель обработки: ведение учета статуса ключа от демозала
+• Срок хранения: <уточняется пока> 
+
+Для продолжения работы с ботом необходимо ваше согласие.
+
+*Вы согласны на обработку ваших персональных данных?*`
+	
+	payload := SendRequest{
+		GroupChatID: chatID,
+		Recipients:  []string{userHUID},
+		Notification: Notification{
+			Status:           "ok",
+			Body:             message,
+			Bubble:           buttons,
+			ButtonsAutoAdjust: true,
+		},
+	}
+	
+	return sendRequest(token, payload)
+}
+
+// SendConsentDeniedMessage - отправить сообщение об отказе
+func SendConsentDeniedMessage(chatID, userHUID string) error {
+	token, err := GetToken()
+	if err != nil {
+		return err
+	}
+	
+	message := `❌ *Доступ ограничен*
+
+Вы не дали согласие на обработку персональных данных.
+
+Для использования бота необходимо дать согласие на обработку ваших персональных данных в соответствии с 152-ФЗ.
+
+Пожалуйста, нажмите кнопку "Согласен" для продолжения работы.`
+	
+	payload := SendRequest{
+		GroupChatID: chatID,
+		Recipients:  []string{userHUID},
+		Notification: Notification{
+			Status: "ok",
+			Body:   message,
+		},
+	}
+	
+	return sendRequest(token, payload)
 }
 
 // ============= ОТПРАВКА СООБЩЕНИЙ =============
@@ -352,36 +487,77 @@ func SendToUser(chatID, userHUID, text string) error {
 func SendButtons(chatID string) error {
     token, err := GetToken()
     if err != nil {
-	return err
+		return err
     }
 
     buttons := [][]Button{
-	{
-	    {Command: "0", Label: "0", HSize: 3},
-	    {Command: "1", Label: "1", HSize: 3},
-	    {Command: "2", Label: "2", HSize: 3},
-	    {Command: "3", Label: "3", HSize: 3},
-	},
-	{
-	    {Command: "/status", Label: "Статус", HSize: 4},
-	    {Command: "/history", Label: "История", HSize: 4},
-	    {Command: "/help", Label: "Помощь", HSize: 4},
-	},
+		{
+			{Command: "0", Label: "0", HSize: 3},
+			{Command: "1", Label: "1", HSize: 3},
+			{Command: "2", Label: "2", HSize: 3},
+			{Command: "3", Label: "3", HSize: 3},
+		},
+		{
+			{Command: "/status", Label: "Статус", HSize: 4},
+			{Command: "/history", Label: "История", HSize: 4},
+			{Command: "/help", Label: "Помощь", HSize: 4},
+		},
     }
 
     payload := SendRequest{
-	GroupChatID: chatID,
-	Notification: Notification{
-	    Status:           "ok",
-	    Body:             "DMZ Key Room - управление ключом",
-	    Bubble:           buttons,
-	    ButtonsAutoAdjust: true,
-	},
+		GroupChatID: chatID,
+		Notification: Notification{
+			Status:           "ok",
+			Body:             "DMZ Key Room - управление ключом",
+			Bubble:           buttons,
+			ButtonsAutoAdjust: true,
+		},
     }
 
     return sendRequest(token, payload)
 }
 
+func SendButtonsToUser(chatID, userHUID string) error {
+    // Проверяем согласие перед отправкой кнопок
+    consentStatus, _ := GetUserConsent(userHUID)
+    if consentStatus != 1 {
+        // Если нет согласия, не отправляем кнопки
+        log.Printf("Пользователь %s не дал согласия, отправляем запрос", userHUID)
+		   return SendConsentRequest(chatID, userHUID)
+    }
+    
+    token, err := GetToken()
+    if err != nil {
+        return err
+    }
+
+    buttons := [][]Button{
+        {
+            {Command: "0", Label: "0", HSize: 3},
+            {Command: "1", Label: "1", HSize: 3},
+            {Command: "2", Label: "2", HSize: 3},
+            {Command: "3", Label: "3", HSize: 3},
+        },
+        {
+            {Command: "/status", Label: "Статус", HSize: 4},
+            {Command: "/history", Label: "История", HSize: 4},
+            {Command: "/help", Label: "Помощь", HSize: 4},
+        },
+    }
+
+    payload := SendRequest{
+        GroupChatID: chatID,
+        Recipients:  []string{userHUID},
+        Notification: Notification{
+            Status:           "ok",
+            Body:             "DMZ Key Room - управление ключом",
+            Bubble:           buttons,
+            ButtonsAutoAdjust: true,
+        },
+    }
+
+    return sendRequest(token, payload)
+}
 
 func DeleteMessage(chatID, syncID string) error {
 	token, err := GetToken()
@@ -588,247 +764,280 @@ func normalizeName(name string) string {
 }
 
 // ============= ОБРАБОТЧИКИ =============
-
 func webhookHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
+    if r.Method != "POST" {
+	http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	return
+    }
 
-	var data WebhookRequest
-	if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
-		log.Printf("❌ Ошибка: %v", err)
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{"status": "error"})
-		return
-	}
+    var data WebhookRequest
+    if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
+	log.Printf("❌ Ошибка: %v", err)
+	w.WriteHeader(http.StatusBadRequest)
+	json.NewEncoder(w).Encode(map[string]string{"status": "error"})
+	return
+    }
 
-	command := data.Command.Body
-	userHUID := data.From.UserHUID
-	userName := data.From.Username
-	if userName == "" {
-		userName = data.From.Name
-	}
-	chatID := data.GroupChatID
-	syncID := data.SyncID
+    command := data.Command.Body
+    userHUID := data.From.UserHUID
+    userName := data.From.Username
+    if userName == "" {
+	userName = data.From.Name
+    }
+    chatID := data.GroupChatID
+    _ = data.SyncID // Игнорируем syncID, если не используется
 
-	log.Printf("Команда: %s от %s (%s)", command, userName, userHUID)
+    log.Printf("Команда: %s от %s (%s)", command, userName, userHUID)
 
-	// Проверяем, является ли пользователь администратором чата
-	isAdmin, err := IsChatAdmin(chatID, userHUID)
+    // ========== ОБРАБОТКА СОГЛАСИЯ ==========
+    if command == "/consent_yes" {
+	err := SetUserConsent(userHUID, userName, 1)
 	if err != nil {
-		log.Printf("⚠️ Ошибка проверки прав: %v", err)
-		isAdmin = false
+	    log.Printf("Ошибка сохранения согласия: %v", err)
+	    SendToUser(chatID, userHUID, "Произошла ошибка. Попробуйте позже.")
+	} else {
+	    SendToUser(chatID, userHUID, "Спасибо! Теперь вы можете использовать бот.")
+	    SendButtonsToUser(chatID, userHUID)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	return
+    }
+    
+    if command == "/consent_no" {
+	err := SetUserConsent(userHUID, userName, 0)
+	if err != nil {
+	    log.Printf("Ошибка сохранения отказа: %v", err)
+	}
+	SendConsentDeniedMessage(chatID, userHUID)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	return
+    }
+
+    // ========== ПРОВЕРКА СОГЛАСИЯ ==========
+    consentStatus, err := GetUserConsent(userHUID)
+    if err != nil {
+	log.Printf("Ошибка проверки согласия: %v", err)
+    }
+    
+    if consentStatus != 1 {
+	log.Printf("Пользователь %s не дал согласия, отправляем запрос", userHUID)
+	SendConsentRequest(chatID, userHUID)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	return
+    }
+
+    // Проверяем, является ли пользователь администратором чата
+    isAdmin, err := IsChatAdmin(chatID, userHUID)
+    if err != nil {
+	log.Printf("Ошибка проверки прав: %v", err)
+	isAdmin = false
+    }
+
+    // Обработка кнопок 0,1,2,3 (статус)
+    statusMap := map[string]int{
+	"0": 0, "1": 1, "2": 2, "3": 3,
+    }
+    if status, ok := statusMap[command]; ok {
+	userInfo, _ := GetUserInfo(userHUID)
+	phone := ""
+	if userInfo != nil && len(userInfo.Emails) > 0 {
+	    phone = userInfo.Emails[0]
 	}
 
-	// Обработка кнопок 0,1,2,3 (статус)
-	statusMap := map[string]int{
-		"0": 0, "1": 1, "2": 2, "3": 3,
+	SetStatus(status, userHUID, userName, phone)
+	now := time.Now().Format("02/01/2006 15:04:05")
+
+	var msg string
+	switch status {
+	case 0:
+	    msg = fmt.Sprintf("*Статус: 0 - Ключ на ресепшене, ДЗ на охране*\n\nУстановил: %s\nВремя: %s", userName, now)
+	    AddHistory(0, userHUID, userName, phone, fmt.Sprintf("%s: Ключ на ресепшене, ДЗ на охране. Установил %s", now, userName))
+	case 1:
+	    msg = fmt.Sprintf("*Статус: 1 - Ключ на ресепшене, ДЗ не на охране*\n\nИнициатор: %s\nТелефон: %s\nВремя: %s", userName, phone, now)
+	    AddHistory(1, userHUID, userName, phone, fmt.Sprintf("%s: Ключ на ресепшене, ДЗ не на охране. Установил %s по телефону: `%s`", now, userName, phone))
+	case 2:
+	    msg = fmt.Sprintf("*Статус: 2 - ДЗ закрыт на ключ*\n\nКлюч у: %s\nТелефон: `%s`\nВремя: %s", userName, phone, now)
+	    AddHistory(2, userHUID, userName, phone, fmt.Sprintf("%s: ДЗ закрыт на ключ, ключ у %s. Телефон: `%s`", now, userName, phone))
+	case 3:
+	    msg = fmt.Sprintf("*Статус: 3 - ДЗ открыт, ключ у меня*\n\nКлюч у: %s\nТелефон: `%s`\nВремя: %s", userName, phone, now)
+	    AddHistory(3, userHUID, userName, phone, fmt.Sprintf("%s: ДЗ открыт, ключ у %s. Телефон: `%s`", now, userName, phone))
 	}
-	if status, ok := statusMap[command]; ok {
-		userInfo, _ := GetUserInfo(userHUID)
-		phone := ""
-		if userInfo != nil && len(userInfo.Emails) > 0 {
-			phone = userInfo.Emails[0]
-		}
+	
+	// Отправляем личное сообщение пользователю
+	SendToUser(chatID, userHUID, msg)
+	
+	// Отправляем кнопки
+	SendButtonsToUser(chatID, userHUID)
+	
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	return
+    }
 
-		SetStatus(status, userHUID, userName, phone)
-		now := time.Now().Format("02/01/2006 15:04:05")
+    // Команды для администраторов чата
+    if isAdmin {
+	// /add ФИО
+	if strings.HasPrefix(command, "/add ") {
+	    fullName := strings.TrimPrefix(command, "/add ")
+	    fullName = strings.TrimSpace(fullName)
 
-		var msg string
-		switch status {
-		case 0:
-			msg = fmt.Sprintf("🔑 *Статус: 0 - Ключ на ресепшене, ДЗ на охране*\n\nУстановил: %s\nВремя: %s", userName, now)
-			AddHistory(0, userHUID, userName, phone, fmt.Sprintf("%s: Ключ на ресепшене, ДЗ на охране. Установил %s", now, userName))
-		case 1:
-			msg = fmt.Sprintf("🔓 *Статус: 1 - Ключ на ресепшене, ДЗ не на охране*\n\nИнициатор: %s\nТелефон: %s\nВремя: %s", userName, phone, now)
-			AddHistory(1, userHUID, userName, phone, fmt.Sprintf("%s: Ключ на ресепшене, ДЗ не на охране. Установил %s по телефону: %s", now, userName, phone))
-		case 2:
-			msg = fmt.Sprintf("🔒 *Статус: 2 - ДЗ закрыт на ключ*\n\nКлюч у: %s\nТелефон: %s\nВремя: %s", userName, phone, now)
-			AddHistory(2, userHUID, userName, phone, fmt.Sprintf("%s: ДЗ закрыт на ключ, ключ у %s. Телефон: %s", now, userName, phone))
-		case 3:
-			msg = fmt.Sprintf("🚪 *Статус: 3 - ДЗ открыт, ключ у меня*\n\nКлюч у: %s\nТелефон: %s\nВремя: %s", userName, phone, now)
-			AddHistory(3, userHUID, userName, phone, fmt.Sprintf("%s: ДЗ открыт, ключ у %s. Телефон: %s", now, userName, phone))
+	    if fullName == "" {
+		SendToUser(chatID, userHUID, "Формат: /add <Фамилия Имя Отчество>")
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		return
+	    }
+
+	    users, err := SearchUserByName(fullName)
+	    if err != nil {
+		SendToUser(chatID, userHUID, fmt.Sprintf("Ошибка поиска: %v", err))
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		return
+	    }
+
+	    if len(users) == 0 {
+		SendToUser(chatID, userHUID, fmt.Sprintf("❌ Пользователь \"%s\" не найден", fullName))
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		return
+	    }
+
+	    if len(users) > 1 {
+		msg := fmt.Sprintf("Найдено несколько пользователей с именем \"%s\":\n\n", fullName)
+		for i, u := range users {
+		    msg += fmt.Sprintf("%d. %s (HUID: %s)\n", i+1, u.Name, u.UserHUID)
 		}
+		msg += "\nУточните: /add_by_huid <HUID>"
 		SendToUser(chatID, userHUID, msg)
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 		return
+	    }
+
+	    targetUser := users[0]
+
+	    isMember, err := IsUserInGroup(chatID, targetUser.UserHUID)
+	    if err != nil {
+		SendToUser(chatID, userHUID, fmt.Sprintf("❌ Ошибка проверки: %v", err))
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		return
+	    }
+
+	    if isMember {
+		SendToUser(chatID, userHUID, fmt.Sprintf("⚠️ %s уже в группе", targetUser.Name))
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		return
+	    }
+
+	    err = AddUserToGroup(chatID, targetUser.UserHUID)
+	    if err != nil {
+		SendToUser(chatID, userHUID, fmt.Sprintf("❌ Ошибка добавления: %v", err))
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		return
+	    }
+
+	    SendToUser(chatID, userHUID, fmt.Sprintf("✅ %s добавлен в группу", targetUser.Name))
+	    SendToUser(chatID, targetUser.UserHUID, fmt.Sprintf("Вас добавили в группу DMZ Key Room!\n\nДобавил: %s\n\nИспользуйте кнопки для управления статусом ключа.", userName))
+	    
+	    w.Header().Set("Content-Type", "application/json")
+	    json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	    return
 	}
 
-	// Команды для администраторов чата
-	if isAdmin {
-		// /add ФИО
-		if strings.HasPrefix(command, "/add ") {
-			fullName := strings.TrimPrefix(command, "/add ")
-			fullName = strings.TrimSpace(fullName)
+	// /add_by_huid <HUID>
+	if strings.HasPrefix(command, "/add_by_huid ") {
+	    targetHUID := strings.TrimPrefix(command, "/add_by_huid ")
+	    targetHUID = strings.TrimSpace(targetHUID)
 
-			if fullName == "" {
-				SendToUser(chatID, userHUID, "Формат: /add <Фамилия Имя Отчество>")
-				DeleteMessage(chatID, syncID)
-				w.Header().Set("Content-Type", "application/json")
-				json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-				return
-			}
+	    _, err := uuid.Parse(targetHUID)
+	    if err != nil {
+		SendToUser(chatID, userHUID, "Неверный формат HUID")
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		return
+	    }
 
-			users, err := SearchUserByName(fullName)
-			if err != nil {
-				SendToUser(chatID, userHUID, fmt.Sprintf("Ошибка поиска: %v", err))
-				DeleteMessage(chatID, syncID)
-				w.Header().Set("Content-Type", "application/json")
-				json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-				return
-			}
+	    userInfo, err := GetUserInfo(targetHUID)
+	    if err != nil {
+		SendToUser(chatID, userHUID, fmt.Sprintf("Пользователь не найден: %v", err))
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		return
+	    }
 
-			if len(users) == 0 {
-				SendToUser(chatID, userHUID, fmt.Sprintf("❌ Пользователь \"%s\" не найден", fullName))
-				DeleteMessage(chatID, syncID)
-				w.Header().Set("Content-Type", "application/json")
-				json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-				return
-			}
+	    isMember, err := IsUserInGroup(chatID, targetHUID)
+	    if err != nil {
+		SendToUser(chatID, userHUID, fmt.Sprintf("Ошибка: %v", err))
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		return
+	    }
 
-			if len(users) > 1 {
-				msg := fmt.Sprintf("Найдено несколько пользователей с именем \"%s\":\n\n", fullName)
-				for i, u := range users {
-					msg += fmt.Sprintf("%d. %s (HUID: %s)\n", i+1, u.Name, u.UserHUID)
-				}
-				msg += "\nУточните: /add_by_huid <HUID>"
-				SendToUser(chatID, userHUID, msg)
-				DeleteMessage(chatID, syncID)
-				w.Header().Set("Content-Type", "application/json")
-				json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-				return
-			}
+	    if isMember {
+		SendToUser(chatID, userHUID, fmt.Sprintf("%s уже в группе", userInfo.Name))
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		return
+	    }
 
-			targetUser := users[0]
+	    err = AddUserToGroup(chatID, targetHUID)
+	    if err != nil {
+		SendToUser(chatID, userHUID, fmt.Sprintf("Ошибка: %v", err))
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		return
+	    }
 
-			isMember, err := IsUserInGroup(chatID, targetUser.UserHUID)
-			if err != nil {
-				SendToUser(chatID, userHUID, fmt.Sprintf("❌ Ошибка проверки: %v", err))
-				DeleteMessage(chatID, syncID)
-				w.Header().Set("Content-Type", "application/json")
-				json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-				return
-			}
+	    SendToUser(chatID, userHUID, fmt.Sprintf("%s добавлен в группу", userInfo.Name))
+	    SendToUser(chatID, targetHUID, fmt.Sprintf("Вас добавили в группу DMZ Key Room!\n\n👤 Добавил: %s", userName))
+	    
+	    w.Header().Set("Content-Type", "application/json")
+	    json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	    return
+	}
+    }
 
-			if isMember {
-				SendToUser(chatID, userHUID, fmt.Sprintf("⚠️ %s уже в группе", targetUser.Name))
-				DeleteMessage(chatID, syncID)
-				w.Header().Set("Content-Type", "application/json")
-				json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-				return
-			}
+    // Обычные команды
+    switch command {
+    case "/status":
+	status, datechange := GetStatus()
+	var statusText string
+	switch status {
+	case 0:
+	    statusText = "0 - Ключ на ресепшене, ДЗ на охране"
+	case 1:
+	    statusText = "1 - Ключ на ресепшене, ДЗ не на охране"
+	case 2:
+	    statusText = "2 - ДЗ закрыт на ключ"
+	case 3:
+	    statusText = "3 - ДЗ открыт, ключ у меня"
+	default:
+	    statusText = "не определен"
+	}
+	msg := fmt.Sprintf("*Текущий статус ключа:*\n%s\n\nПоследнее изменение: %s", statusText, datechange.Format("02/01/2006 15:04:05"))
+	SendToUser(chatID, userHUID, msg)
 
-			err = AddUserToGroup(chatID, targetUser.UserHUID)
-			if err != nil {
-				SendToUser(chatID, userHUID, fmt.Sprintf("❌ Ошибка добавления: %v", err))
-				DeleteMessage(chatID, syncID)
-				w.Header().Set("Content-Type", "application/json")
-				json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-				return
-			}
-
-			SendToUser(chatID, userHUID, fmt.Sprintf("✅ %s добавлен в группу", targetUser.Name))
-			SendToUser(chatID, targetUser.UserHUID, fmt.Sprintf("Вас добавили в группу DMZ Key Room!\n\n👤 Добавил: %s\n\nИспользуйте кнопки для управления статусом ключа.", userName))
-			DeleteMessage(chatID, syncID)
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-			return
-		}
-
-		// /add_by_huid <HUID>
-		if strings.HasPrefix(command, "/add_by_huid ") {
-			targetHUID := strings.TrimPrefix(command, "/add_by_huid ")
-			targetHUID = strings.TrimSpace(targetHUID)
-
-			_, err := uuid.Parse(targetHUID)
-			if err != nil {
-				SendToUser(chatID, userHUID, "❌ Неверный формат HUID")
-				DeleteMessage(chatID, syncID)
-				w.Header().Set("Content-Type", "application/json")
-				json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-				return
-			}
-
-			userInfo, err := GetUserInfo(targetHUID)
-			if err != nil {
-				SendToUser(chatID, userHUID, fmt.Sprintf("❌ Пользователь не найден: %v", err))
-				DeleteMessage(chatID, syncID)
-				w.Header().Set("Content-Type", "application/json")
-				json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-				return
-			}
-
-			isMember, err := IsUserInGroup(chatID, targetHUID)
-			if err != nil {
-				SendToUser(chatID, userHUID, fmt.Sprintf("❌ Ошибка: %v", err))
-				DeleteMessage(chatID, syncID)
-				w.Header().Set("Content-Type", "application/json")
-				json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-				return
-			}
-
-			if isMember {
-				SendToUser(chatID, userHUID, fmt.Sprintf("⚠️ %s уже в группе", userInfo.Name))
-				DeleteMessage(chatID, syncID)
-				w.Header().Set("Content-Type", "application/json")
-				json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-				return
-			}
-
-			err = AddUserToGroup(chatID, targetHUID)
-			if err != nil {
-				SendToUser(chatID, userHUID, fmt.Sprintf("❌ Ошибка: %v", err))
-				DeleteMessage(chatID, syncID)
-				w.Header().Set("Content-Type", "application/json")
-				json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-				return
-			}
-
-			SendToUser(chatID, userHUID, fmt.Sprintf("✅ %s добавлен в группу", userInfo.Name))
-			SendToUser(chatID, targetHUID, fmt.Sprintf("🎉 Вас добавили в группу DMZ Key Room!\n\n👤 Добавил: %s", userName))
-			DeleteMessage(chatID, syncID)
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-			return
-		}
+    case "/history":
+	history, err := GetHistory()
+	if err != nil || len(history) == 0 {
+	    SendToUser(chatID, userHUID, "История пуста")
+	} else {
+	    msg := "*История изменения статуса ключа:*\n\n"
+	    for _, h := range history {
+		msg += fmt.Sprintf("%s\n", h["message"])
+	    }
+	    SendToUser(chatID, userHUID, msg)
 	}
 
-	// Обычные команды
-	switch command {
-	case "/status":
-		status, datechange := GetStatus()
-		var statusText string
-		switch status {
-		case 0:
-			statusText = "0 - Ключ на ресепшене, ДЗ на охране"
-		case 1:
-			statusText = "1 - Ключ на ресепшене, ДЗ не на охране"
-		case 2:
-			statusText = "2 - ДЗ закрыт на ключ"
-		case 3:
-			statusText = "3 - ДЗ открыт, ключ у меня"
-		default:
-			statusText = "не определен"
-		}
-		msg := fmt.Sprintf("*Текущий статус ключа:*\n%s\n\nПоследнее изменение: %s", statusText, datechange.Format("02/01/2006 15:04:05"))
-		SendToUser(chatID, userHUID, msg)
-
-	case "/history":
-		history, err := GetHistory()
-		if err != nil || len(history) == 0 {
-			SendToUser(chatID, userHUID, "История пуста")
-		} else {
-			msg := "*История изменения статуса ключа:*\n\n"
-			for _, h := range history {
-				msg += fmt.Sprintf("%s\n", h["message"])
-			}
-			SendToUser(chatID, userHUID, msg)
-		}
-
-	case "/help":
-		helpText := `0 - Ключ на ресепшене, ДЗ на охране
+    case "/help":
+	helpText := `0 - Ключ на ресепшене, ДЗ на охране
 1 - Ключ на ресепшене, ДЗ не на охране
 2 - ДЗ закрыт на ключ
 3 - ДЗ открыт, ключ у меня
@@ -836,16 +1045,17 @@ func webhookHandler(w http.ResponseWriter, r *http.Request) {
 /history - история статуса ключа
 /help - показать справку
 
-+79262292310 - телефон для снятия с охраны демозала`
-		SendToUser(chatID, userHUID, helpText)
+[Позвонить](tel:+79262292310) - телефон для снятия с охраны демозала`
+	SendToUser(chatID, userHUID, helpText)
 
-	default:
-		// Игнорируем неизвестные команды
-	}
+    default:
+	// Игнорируем неизвестные команды
+    }
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
+
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
@@ -857,31 +1067,31 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 
 func startStatusResetter() {
     go func() {
-	for {
-	    // Вычисляем время до следующего 23:59
-	    now := time.Now()
-	    next := time.Date(now.Year(), now.Month(), now.Day(), 23, 59, 0, 0, now.Location())
-	    
-	    // Если уже прошло 23:59 сегодня, ставим на завтра
-	    if now.After(next) {
-		next = next.Add(24 * time.Hour)
-	    }
-	    
-	    waitDuration := next.Sub(now)
-	    log.Printf("Следующий сброс статуса в: %s (через %s)", next.Format("15:04:05"), waitDuration)
-	    
-	    // Ждем до 23:59
-	    time.Sleep(waitDuration)
-	    
-	    // Сбрасываем статус на 0
-	    log.Println("Автоматический сброс статуса на 0 (23:59)")
-	    
-	    nowTime := time.Now().Format("02/01/2006 15:04:05")
-	    SetStatus(0, "system", "Система", "")
-	    AddHistory(0, "system", "Система", "", fmt.Sprintf("%s: Автоматический сброс статуса на 0 (ночной сброс)", nowTime))
-	    
-	    log.Println("Статус сброшен на 0")
-	}
+		for {
+			// Вычисляем время до следующего 23:59
+			now := time.Now()
+			next := time.Date(now.Year(), now.Month(), now.Day(), 23, 59, 0, 0, now.Location())
+			
+			// Если уже прошло 23:59 сегодня, ставим на завтра
+			if now.After(next) {
+				next = next.Add(24 * time.Hour)
+			}
+			
+			waitDuration := next.Sub(now)
+			log.Printf("Следующий сброс статуса в: %s (через %s)", next.Format("15:04:05"), waitDuration)
+			
+			// Ждем до 23:59
+			time.Sleep(waitDuration)
+			
+			// Сбрасываем статус на 0
+			log.Println("Автоматический сброс статуса на 0 (23:59)")
+			
+			nowTime := time.Now().Format("02/01/2006 15:04:05")
+			SetStatus(0, "system", "Система", "")
+			AddHistory(0, "system", "Система", "", fmt.Sprintf("%s: Автоматический сброс статуса на 0 (ночной сброс)", nowTime))
+			
+			log.Println("Статус сброшен на 0")
+		}
     }()
 }
 
@@ -927,7 +1137,7 @@ func main() {
 	}
 	defer db.Close()
 
-	startTokenRefresher()
+	//startTokenRefresher()
 	startStatusResetter()
 	if _, err := GetToken(); err != nil {
 		log.Fatalf("Не удалось получить токен: %v", err)
@@ -947,7 +1157,14 @@ func main() {
 	log.Printf("Сервер запущен на порту %s", config.WebhookPort)
 	log.Println("Ожидание команд...\n")
 
-	if err := http.ListenAndServeTLS(":"+config.WebhookPort, "cert.pem", "key.pem", nil); err != nil {
-        log.Fatal("Ошибка:", err)
-    }
+	// Запуск сервера (можно выбрать HTTP или HTTPS)
+	// Для HTTPS с валидным сертификатом:
+	 if err := http.ListenAndServeTLS(":"+config.WebhookPort, "cert.pem", "key.pem", nil); err != nil {
+	     log.Fatal("Ошибка:", err)
+	 }
+	
+	// Для HTTP (только разработка):
+//	if err := http.ListenAndServe(":"+config.WebhookPort, nil); err != nil {
+///		log.Fatal("Ошибка:", err)
+	//}
 }
