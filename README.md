@@ -20,6 +20,9 @@
 
 От express получаем webhook по адресу , указанному в настройках бота. У меня это на порту WEBHOOK_PORT
 
+ <a href="https://docs.express.ms/smartapps/developer-guide/development-debugging/" >Документация backend и frontend читаем</a>
+
+
 Перед запуском заполняем файл
 
 #### Config
