@@ -1,4 +1,4 @@
-//version 0.2 alpha
+//version 0.3 alpha
 
 package main
 
@@ -6,11 +6,13 @@ import (
 	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
+//	"crypto/tls"
 	"database/sql"
 	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -31,6 +33,8 @@ type Config struct {
 	ChatID        string
 	WebhookPort   string
 	DBPath        string
+	CertFile      string
+	KeyFile       string
 }
 
 var config Config
@@ -42,14 +46,15 @@ type Button struct {
 	Command string                 `json:"command"`
 	Label   string                 `json:"label"`
 	Data    map[string]interface{} `json:"data,omitempty"`
-	HSize   int                    `json:"h_size,omitempty"` // 1-12, где 12 = вся ширина
+	HSize   int                    `json:"h_size,omitempty"`
+	Silent  bool                   `json:"silent,omitempty"`
 }
 
 type Notification struct {
-	Status           string     `json:"status"`
-	Body             string     `json:"body"`
-	Bubble           [][]Button `json:"bubble,omitempty"`
-	ButtonsAutoAdjust bool      `json:"buttons_auto_adjust,omitempty"`
+	Status            string     `json:"status"`
+	Body              string     `json:"body"`
+	Bubble            [][]Button `json:"bubble,omitempty"`
+	ButtonsAutoAdjust bool       `json:"buttons_auto_adjust,omitempty"`
 }
 
 type SendRequest struct {
@@ -68,15 +73,17 @@ type UserInfo struct {
 }
 
 type ChatMember struct {
-	HUID  string `json:"huid"`
-	Name  string `json:"name"`
-	Admin bool   `json:"admin"`
-	Owner bool   `json:"owner"`
+	HUID     string `json:"user_huid"`
+	Name     string `json:"name"`
+	Admin    bool   `json:"admin"`
+	Owner    bool   `json:"owner"`
+	UserKind string `json:"user_kind"`
 }
 
 type ChatInfo struct {
 	GroupChatID string       `json:"group_chat_id"`
 	Name        string       `json:"name"`
+	ChatType    string       `json:"chat_type"`
 	Members     []ChatMember `json:"members"`
 }
 
@@ -114,18 +121,24 @@ func fetchNewToken() (string, error) {
 	url := fmt.Sprintf("%s/api/v2/botx/bots/%s/token?signature=%s",
 		config.ExpressDomain, config.BotID, signature)
 
-	resp, err := http.Get(url)
+	log.Printf("🔄 Запрос токена: %s", url)
+	
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get(url)
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	log.Printf("📥 Ответ токена: %s", string(body))
 
 	var result struct {
 		Status string `json:"status"`
 		Result string `json:"result"`
 	}
 
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := json.Unmarshal(body, &result); err != nil {
 		return "", err
 	}
 
@@ -152,7 +165,7 @@ func GetToken() (string, error) {
 		return tokenManager.token, nil
 	}
 
-	log.Println("Обновление токена...")
+	log.Println("🔄 Обновление токена...")
 	newToken, err := fetchNewToken()
 	if err != nil {
 		return "", err
@@ -160,7 +173,7 @@ func GetToken() (string, error) {
 
 	tokenManager.token = newToken
 	tokenManager.expiresAt = time.Now().Add(14 * time.Minute)
-	log.Printf("Токен обновлен! Действует до: %s", tokenManager.expiresAt.Format("15:04:05"))
+	log.Printf("✅ Токен обновлен! Действует до: %s", tokenManager.expiresAt.Format("15:04:05"))
 	return newToken, nil
 }
 
@@ -168,17 +181,17 @@ func startTokenRefresher() {
 	ticker := time.NewTicker(14 * time.Minute)
 	go func() {
 		for range ticker.C {
-			log.Println("Плановое обновление токена...")
+			log.Println("🔄 Плановое обновление токена...")
 			newToken, err := fetchNewToken()
 			if err != nil {
-				log.Printf(" Ошибка обновления: %v", err)
+				log.Printf("❌ Ошибка обновления: %v", err)
 				continue
 			}
 			tokenManager.mu.Lock()
 			tokenManager.token = newToken
 			tokenManager.expiresAt = time.Now().Add(14 * time.Minute)
 			tokenManager.mu.Unlock()
-			log.Println("Токен обновлен")
+			log.Println("✅ Токен обновлен")
 		}
 	}()
 }
@@ -192,7 +205,6 @@ func initDB() error {
 		return err
 	}
 
-	// Таблица статуса ключа
 	_, err = db.Exec(`
 		CREATE TABLE IF NOT EXISTS key_status (
 			id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -204,7 +216,6 @@ func initDB() error {
 		return err
 	}
 
-	// Таблица истории
 	_, err = db.Exec(`
 		CREATE TABLE IF NOT EXISTS history (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -220,7 +231,6 @@ func initDB() error {
 		return err
 	}
 
-	// НОВАЯ ТАБЛИЦА для согласия на обработку ПД
 	_, err = db.Exec(`
 		CREATE TABLE IF NOT EXISTS user_consent (
 			user_huid TEXT PRIMARY KEY,
@@ -235,7 +245,6 @@ func initDB() error {
 		return err
 	}
 
-	// Проверка и создание записи по умолчанию для key_status
 	var count int
 	err = db.QueryRow("SELECT COUNT(*) FROM key_status").Scan(&count)
 	if err != nil {
@@ -249,10 +258,10 @@ func initDB() error {
 		if err != nil {
 			return err
 		}
-		log.Println("Создана запись статуса по умолчанию (status=0)")
+		log.Println("✅ Создана запись статуса по умолчанию")
 	}
 
-	log.Println("База данных инициализирована")
+	log.Println("✅ База данных инициализирована")
 	return nil
 }
 
@@ -271,7 +280,7 @@ func SetStatus(status int, userHUID, userName, phone string) {
 	now := time.Now().Format("2006-01-02 15:04:05")
 	_, err := db.Exec("UPDATE key_status SET status = ?, datechange = ? WHERE id = 1", status, now)
 	if err != nil {
-		log.Printf("Ошибка обновления статуса: %v", err)
+		log.Printf("❌ Ошибка обновления статуса: %v", err)
 	}
 }
 
@@ -282,17 +291,16 @@ func AddHistory(status int, userHUID, userName, phone, message string) {
 		VALUES (?, ?, ?, ?, ?, ?)
 	`, now, status, userHUID, userName, phone, message)
 	if err != nil {
-		log.Printf("Ошибка добавления истории: %v", err)
+		log.Printf("❌ Ошибка добавления истории: %v", err)
 	}
 
-	// Оставляем только последние 8 записей
 	_, err = db.Exec(`
 		DELETE FROM history WHERE id NOT IN (
 			SELECT id FROM history ORDER BY timestamp DESC LIMIT 8
 		)
 	`)
 	if err != nil {
-		log.Printf("Ошибка очистки истории: %v", err)
+		log.Printf("❌ Ошибка очистки истории: %v", err)
 	}
 }
 
@@ -329,12 +337,11 @@ func GetHistory() ([]map[string]string, error) {
 
 // ============= УПРАВЛЕНИЕ СОГЛАСИЕМ =============
 
-// GetUserConsent - получить статус согласия пользователя
 func GetUserConsent(userHUID string) (int, error) {
 	var consentStatus int
 	err := db.QueryRow("SELECT consent_status FROM user_consent WHERE user_huid = ?", userHUID).Scan(&consentStatus)
 	if err == sql.ErrNoRows {
-		return 0, nil // Пользователь не найден - считаем что не согласен
+		return 0, nil
 	}
 	if err != nil {
 		return 0, err
@@ -342,7 +349,6 @@ func GetUserConsent(userHUID string) (int, error) {
 	return consentStatus, nil
 }
 
-// SetUserConsent - установить статус согласия пользователя
 func SetUserConsent(userHUID, userName string, consentStatus int) error {
 	now := time.Now().Format("2006-01-02 15:04:05")
 	
@@ -353,7 +359,6 @@ func SetUserConsent(userHUID, userName string, consentStatus int) error {
 		consentDate = nil
 	}
 	
-	// Используем INSERT OR REPLACE для обновления или вставки
 	_, err := db.Exec(`
 		INSERT INTO user_consent (user_huid, user_name, consent_status, consent_date, updated_at)
 		VALUES (?, ?, ?, ?, ?)
@@ -365,26 +370,167 @@ func SetUserConsent(userHUID, userName string, consentStatus int) error {
 	`, userHUID, userName, consentStatus, consentDate, now)
 	
 	if err != nil {
-		log.Printf("Ошибка сохранения согласия: %v", err)
+		log.Printf("❌ Ошибка сохранения согласия: %v", err)
 		return err
 	}
 	
-	log.Printf("Пользователь %s (%s) статус согласия: %d", userName, userHUID, consentStatus)
+	log.Printf("✅ Пользователь %s (%s) статус согласия: %d", userName, userHUID, consentStatus)
 	return nil
 }
 
-// SendConsentRequest - отправить запрос на согласие
+// ============= ОТПРАВКА СООБЩЕНИЙ =============
+
+func sendRequest(token string, payload SendRequest) error {
+	jsonData, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("ошибка маршалинга: %v", err)
+	}
+	
+	log.Printf("📤 Отправка запроса в Express:")
+	log.Printf("   Payload: %s", string(jsonData))
+	
+	url := fmt.Sprintf("%s/api/v4/botx/notifications/direct", config.ExpressDomain)
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return err
+	}
+	
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	
+	log.Printf("📥 Ответ от Express: %s", string(body))
+	
+	var result map[string]interface{}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return fmt.Errorf("ошибка парсинга ответа: %v", err)
+	}
+	
+	if status, ok := result["status"]; ok && status == "ok" {
+		return nil
+	}
+	
+	return fmt.Errorf("send failed: %v", result)
+}
+
+func SendToUser(chatID, userHUID, text string) error {
+	token, err := GetToken()
+	if err != nil {
+		return err
+	}
+	
+	log.Printf("📨 Отправка сообщения пользователю %s в чат %s", userHUID, chatID)
+	
+	payload := SendRequest{
+		GroupChatID: chatID,
+		Recipients:  []string{userHUID},
+		Notification: Notification{
+			Status: "ok",
+			Body:   text,
+		},
+	}
+	
+	return sendRequest(token, payload)
+}
+
+func SendButtons(chatID string) error {
+	token, err := GetToken()
+	if err != nil {
+		return err
+	}
+	
+	log.Printf("📨 Отправка кнопок в чат: %s", chatID)
+	
+	buttons := [][]Button{
+		{
+			{Command: "0", Label: "0", HSize: 3, Silent: true},
+			{Command: "1", Label: "1", HSize: 3, Silent: true},
+			{Command: "2", Label: "2", HSize: 3, Silent: true},
+			{Command: "3", Label: "3", HSize: 3, Silent: true},
+		},
+		{
+			{Command: "/status", Label: "Статус", HSize: 4, Silent: true},
+			{Command: "/history", Label: "История", HSize: 4, Silent: true},
+			{Command: "/help", Label: "Помощь", HSize: 4, Silent: true},
+		},
+	}
+
+	payload := SendRequest{
+		GroupChatID: chatID,
+		Notification: Notification{
+			Status:           "ok",
+			Body:             "DMZ Key Room - управление ключом",
+			Bubble:           buttons,
+			ButtonsAutoAdjust: true,
+		},
+	}
+	
+	return sendRequest(token, payload)
+}
+
+func SendButtonsToUser(chatID, userHUID string) error {
+	consentStatus, _ := GetUserConsent(userHUID)
+	if consentStatus != 1 {
+		log.Printf("🔒 Пользователь %s не дал согласия, отправляем запрос", userHUID)
+		return SendConsentRequest(chatID, userHUID)
+	}
+	
+	token, err := GetToken()
+	if err != nil {
+		return err
+	}
+
+	log.Printf("📨 Отправка кнопок пользователю %s в чат %s", userHUID, chatID)
+	
+	buttons := [][]Button{
+		{
+			{Command: "0", Label: "0", HSize: 3, Silent: true},
+			{Command: "1", Label: "1", HSize: 3, Silent: true},
+			{Command: "2", Label: "2", HSize: 3, Silent: true},
+			{Command: "3", Label: "3", HSize: 3, Silent: true},
+		},
+		{
+			{Command: "/status", Label: "Статус", HSize: 4, Silent: true},
+			{Command: "/history", Label: "История", HSize: 4, Silent: true},
+			{Command: "/help", Label: "Помощь", HSize: 4, Silent: true},
+		},
+	}
+	
+	payload := SendRequest{
+		GroupChatID: chatID,
+		Recipients:  []string{userHUID},
+		Notification: Notification{
+			Status:           "ok",
+			Body:             "DMZ Key Room - управление ключом",
+			Bubble:           buttons,
+			ButtonsAutoAdjust: true,
+		},
+	}
+	
+	return sendRequest(token, payload)
+}
+
 func SendConsentRequest(chatID, userHUID string) error {
 	token, err := GetToken()
 	if err != nil {
 		return err
 	}
 	
-	// Кнопки для согласия
 	buttons := [][]Button{
 		{
-			{Command: "/consent_yes", Label: "✅ Согласен", HSize: 6},
-			{Command: "/consent_no", Label: "❌ Не согласен", HSize: 6},
+			{Command: "/consent_yes", Label: "✅ Согласен", HSize: 6, Silent: true},
+			{Command: "/consent_no", Label: "❌ Не согласен", HSize: 6, Silent: true},
 		},
 	}
 	
@@ -395,7 +541,7 @@ func SendConsentRequest(chatID, userHUID string) error {
 • Ваши персональные данные (ФИО, номер телефона, HUID) будут обрабатываться
 • Данные хранятся в защищенной базе данных
 • Цель обработки: ведение учета статуса ключа от демозала
-• Срок хранения: <уточняется пока> 
+• Срок хранения: 5 лет
 
 Для продолжения работы с ботом необходимо ваше согласие.
 
@@ -412,10 +558,10 @@ func SendConsentRequest(chatID, userHUID string) error {
 		},
 	}
 	
+	log.Printf("📨 Отправка запроса согласия пользователю %s", userHUID)
 	return sendRequest(token, payload)
 }
 
-// SendConsentDeniedMessage - отправить сообщение об отказе
 func SendConsentDeniedMessage(chatID, userHUID string) error {
 	token, err := GetToken()
 	if err != nil {
@@ -440,123 +586,6 @@ func SendConsentDeniedMessage(chatID, userHUID string) error {
 	}
 	
 	return sendRequest(token, payload)
-}
-
-// ============= ОТПРАВКА СООБЩЕНИЙ =============
-
-func sendRequest(token string, payload SendRequest) error {
-	jsonData, _ := json.Marshal(payload)
-	url := fmt.Sprintf("%s/api/v4/botx/notifications/direct", config.ExpressDomain)
-	req, _ := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+token)
-
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	var result map[string]interface{}
-	json.NewDecoder(resp.Body).Decode(&result)
-	if status, ok := result["status"]; ok && status == "ok" {
-		return nil
-	}
-	return fmt.Errorf("send failed: %v", result)
-}
-
-func SendToUser(chatID, userHUID, text string) error {
-	token, err := GetToken()
-	if err != nil {
-		return err
-	}
-
-	payload := SendRequest{
-		GroupChatID: chatID,
-		Recipients:  []string{userHUID},
-		Notification: Notification{
-			Status: "ok",
-			Body:   text,
-		},
-	}
-
-	return sendRequest(token, payload)
-}
-
-func SendButtons(chatID string) error {
-    token, err := GetToken()
-    if err != nil {
-		return err
-    }
-
-    buttons := [][]Button{
-		{
-			{Command: "0", Label: "0", HSize: 3},
-			{Command: "1", Label: "1", HSize: 3},
-			{Command: "2", Label: "2", HSize: 3},
-			{Command: "3", Label: "3", HSize: 3},
-		},
-		{
-			{Command: "/status", Label: "Статус", HSize: 4},
-			{Command: "/history", Label: "История", HSize: 4},
-			{Command: "/help", Label: "Помощь", HSize: 4},
-		},
-    }
-
-    payload := SendRequest{
-		GroupChatID: chatID,
-		Notification: Notification{
-			Status:           "ok",
-			Body:             "DMZ Key Room - управление ключом",
-			Bubble:           buttons,
-			ButtonsAutoAdjust: true,
-		},
-    }
-
-    return sendRequest(token, payload)
-}
-
-func SendButtonsToUser(chatID, userHUID string) error {
-    // Проверяем согласие перед отправкой кнопок
-    consentStatus, _ := GetUserConsent(userHUID)
-    if consentStatus != 1 {
-        // Если нет согласия, не отправляем кнопки
-        log.Printf("Пользователь %s не дал согласия, отправляем запрос", userHUID)
-		   return SendConsentRequest(chatID, userHUID)
-    }
-    
-    token, err := GetToken()
-    if err != nil {
-        return err
-    }
-
-    buttons := [][]Button{
-        {
-            {Command: "0", Label: "0", HSize: 3},
-            {Command: "1", Label: "1", HSize: 3},
-            {Command: "2", Label: "2", HSize: 3},
-            {Command: "3", Label: "3", HSize: 3},
-        },
-        {
-            {Command: "/status", Label: "Статус", HSize: 4},
-            {Command: "/history", Label: "История", HSize: 4},
-            {Command: "/help", Label: "Помощь", HSize: 4},
-        },
-    }
-
-    payload := SendRequest{
-        GroupChatID: chatID,
-        Recipients:  []string{userHUID},
-        Notification: Notification{
-            Status:           "ok",
-            Body:             "DMZ Key Room - управление ключом",
-            Bubble:           buttons,
-            ButtonsAutoAdjust: true,
-        },
-    }
-
-    return sendRequest(token, payload)
 }
 
 func DeleteMessage(chatID, syncID string) error {
@@ -589,11 +618,11 @@ func AddUserToGroup(chatID, userHUID string) error {
 
 	payload := map[string]interface{}{
 		"group_chat_id": chatID,
-		"users":         []string{userHUID},
+		"user_huids":    []string{userHUID},
 	}
 
 	jsonData, _ := json.Marshal(payload)
-	url := fmt.Sprintf("%s/api/v4/botx/chats/add_users", config.ExpressDomain)
+	url := fmt.Sprintf("%s/api/v3/botx/chats/add_user", config.ExpressDomain)
 	req, _ := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+token)
@@ -630,7 +659,7 @@ func GetChatInfo(chatID string) (*ChatInfo, error) {
 		return nil, err
 	}
 
-	url := fmt.Sprintf("%s/api/v3/botx/chats/%s", config.ExpressDomain, chatID)
+	url := fmt.Sprintf("%s/api/v3/botx/chats/info?group_chat_id=%s", config.ExpressDomain, chatID)
 	req, _ := http.NewRequest("GET", url, nil)
 	req.Header.Set("Authorization", "Bearer "+token)
 
@@ -651,9 +680,9 @@ func GetChatInfo(chatID string) (*ChatInfo, error) {
 	}
 
 	if result.Status != "ok" {
-		return nil, fmt.Errorf("failed to get chat info")
+		return nil, fmt.Errorf("failed to get chat info: %s", result.Status)
 	}
-
+	
 	return &result.Result, nil
 }
 
@@ -698,7 +727,7 @@ func GetUserInfo(userHUID string) (*UserInfo, error) {
 	}
 
 	if result.Status != "ok" {
-		return nil, fmt.Errorf("user not found")
+		return nil, fmt.Errorf("user not found: %s", result.Status)
 	}
 
 	return &result.Result, nil
@@ -744,6 +773,9 @@ func SearchUserByName(fullName string) ([]UserInfo, error) {
 				AdDomain: record[2],
 				Active:   len(record) > 6 && record[6] == "true",
 			}
+			if len(record) > 3 && record[3] != "" {
+				user.Emails = []string{record[3]}
+			}
 			users = append(users, user)
 		}
 	}
@@ -763,299 +795,294 @@ func normalizeName(name string) string {
 	return strings.ToLower(name)
 }
 
+func GetAllUserHUIDs(chatID string) ([]string, error) {
+	chatInfo, err := GetChatInfo(chatID)
+	if err != nil {
+		return nil, err
+	}
+	
+	huids := make([]string, len(chatInfo.Members))
+	for i, member := range chatInfo.Members {
+		huids[i] = member.HUID
+		log.Printf("   Участник %d: %s (%s)", i+1, member.Name, member.HUID)
+	}
+	return huids, nil
+}
+
 // ============= ОБРАБОТЧИКИ =============
+
 func webhookHandler(w http.ResponseWriter, r *http.Request) {
-    if r.Method != "POST" {
-	http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-	return
-    }
+	log.Printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+	log.Printf("📨 Получен запрос: %s %s", r.Method, r.URL.Path)
+	log.Printf("📋 RemoteAddr: %s", r.RemoteAddr)
+	
+	if r.Method != "POST" {
+		log.Printf("❌ Неверный метод: %s", r.Method)
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 
-    var data WebhookRequest
-    if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
-	log.Printf("❌ Ошибка: %v", err)
-	w.WriteHeader(http.StatusBadRequest)
-	json.NewEncoder(w).Encode(map[string]string{"status": "error"})
-	return
-    }
-
-    command := data.Command.Body
-    userHUID := data.From.UserHUID
-    userName := data.From.Username
-    if userName == "" {
-	userName = data.From.Name
-    }
-    chatID := data.GroupChatID
-    _ = data.SyncID // Игнорируем syncID, если не используется
-
-    log.Printf("Команда: %s от %s (%s)", command, userName, userHUID)
-
-    // ========== ОБРАБОТКА СОГЛАСИЯ ==========
-    if command == "/consent_yes" {
-	err := SetUserConsent(userHUID, userName, 1)
+	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil {
-	    log.Printf("Ошибка сохранения согласия: %v", err)
-	    SendToUser(chatID, userHUID, "Произошла ошибка. Попробуйте позже.")
-	} else {
-	    SendToUser(chatID, userHUID, "Спасибо! Теперь вы можете использовать бот.")
-	    SendButtonsToUser(chatID, userHUID)
-	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-	return
-    }
-    
-    if command == "/consent_no" {
-	err := SetUserConsent(userHUID, userName, 0)
-	if err != nil {
-	    log.Printf("Ошибка сохранения отказа: %v", err)
-	}
-	SendConsentDeniedMessage(chatID, userHUID)
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-	return
-    }
-
-    // ========== ПРОВЕРКА СОГЛАСИЯ ==========
-    consentStatus, err := GetUserConsent(userHUID)
-    if err != nil {
-	log.Printf("Ошибка проверки согласия: %v", err)
-    }
-    
-    if consentStatus != 1 {
-	log.Printf("Пользователь %s не дал согласия, отправляем запрос", userHUID)
-	SendConsentRequest(chatID, userHUID)
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-	return
-    }
-
-    // Проверяем, является ли пользователь администратором чата
-    isAdmin, err := IsChatAdmin(chatID, userHUID)
-    if err != nil {
-	log.Printf("Ошибка проверки прав: %v", err)
-	isAdmin = false
-    }
-
-    // Обработка кнопок 0,1,2,3 (статус)
-    statusMap := map[string]int{
-	"0": 0, "1": 1, "2": 2, "3": 3,
-    }
-    if status, ok := statusMap[command]; ok {
-	userInfo, _ := GetUserInfo(userHUID)
-	phone := ""
-	if userInfo != nil && len(userInfo.Emails) > 0 {
-	    phone = userInfo.Emails[0]
-	}
-
-	SetStatus(status, userHUID, userName, phone)
-	now := time.Now().Format("02/01/2006 15:04:05")
-
-	var msg string
-	switch status {
-	case 0:
-	    msg = fmt.Sprintf("*Статус: 0 - Ключ на ресепшене, ДЗ на охране*\n\nУстановил: %s\nВремя: %s", userName, now)
-	    AddHistory(0, userHUID, userName, phone, fmt.Sprintf("%s: Ключ на ресепшене, ДЗ на охране. Установил %s", now, userName))
-	case 1:
-	    msg = fmt.Sprintf("*Статус: 1 - Ключ на ресепшене, ДЗ не на охране*\n\nИнициатор: %s\nТелефон: %s\nВремя: %s", userName, phone, now)
-	    AddHistory(1, userHUID, userName, phone, fmt.Sprintf("%s: Ключ на ресепшене, ДЗ не на охране. Установил %s по телефону: `%s`", now, userName, phone))
-	case 2:
-	    msg = fmt.Sprintf("*Статус: 2 - ДЗ закрыт на ключ*\n\nКлюч у: %s\nТелефон: `%s`\nВремя: %s", userName, phone, now)
-	    AddHistory(2, userHUID, userName, phone, fmt.Sprintf("%s: ДЗ закрыт на ключ, ключ у %s. Телефон: `%s`", now, userName, phone))
-	case 3:
-	    msg = fmt.Sprintf("*Статус: 3 - ДЗ открыт, ключ у меня*\n\nКлюч у: %s\nТелефон: `%s`\nВремя: %s", userName, phone, now)
-	    AddHistory(3, userHUID, userName, phone, fmt.Sprintf("%s: ДЗ открыт, ключ у %s. Телефон: `%s`", now, userName, phone))
+		log.Printf("❌ Ошибка чтения тела: %v", err)
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"status": "error"})
+		return
 	}
 	
-	// Отправляем личное сообщение пользователю
-	SendToUser(chatID, userHUID, msg)
-	
-	// Отправляем кнопки
-	SendButtonsToUser(chatID, userHUID)
-	
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-	return
-    }
+	log.Printf("📦 Тело запроса: %s", string(bodyBytes))
+	r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
 
-    // Команды для администраторов чата
-    if isAdmin {
-	// /add ФИО
-	if strings.HasPrefix(command, "/add ") {
-	    fullName := strings.TrimPrefix(command, "/add ")
-	    fullName = strings.TrimSpace(fullName)
-
-	    if fullName == "" {
-		SendToUser(chatID, userHUID, "Формат: /add <Фамилия Имя Отчество>")
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	var data WebhookRequest
+	if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
+		log.Printf("❌ Ошибка декодирования: %v", err)
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"status": "error"})
 		return
-	    }
+	}
 
-	    users, err := SearchUserByName(fullName)
-	    if err != nil {
-		SendToUser(chatID, userHUID, fmt.Sprintf("Ошибка поиска: %v", err))
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-		return
-	    }
+	command := data.Command.Body
+	userHUID := data.From.UserHUID
+	userName := data.From.Username
+	if userName == "" {
+		userName = data.From.Name
+	}
+	chatID := data.GroupChatID
 
-	    if len(users) == 0 {
-		SendToUser(chatID, userHUID, fmt.Sprintf("❌ Пользователь \"%s\" не найден", fullName))
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-		return
-	    }
+	log.Printf("✅ Команда: '%s' от %s (%s) в чате %s", command, userName, userHUID, chatID)
 
-	    if len(users) > 1 {
-		msg := fmt.Sprintf("Найдено несколько пользователей с именем \"%s\":\n\n", fullName)
-		for i, u := range users {
-		    msg += fmt.Sprintf("%d. %s (HUID: %s)\n", i+1, u.Name, u.UserHUID)
+	// Обработка согласия
+	if command == "/consent_yes" {
+		log.Printf("📝 Пользователь %s дал согласие", userName)
+		if err := SetUserConsent(userHUID, userName, 1); err != nil {
+			log.Printf("❌ Ошибка сохранения: %v", err)
+			SendToUser(chatID, userHUID, "Произошла ошибка. Попробуйте позже.")
+		} else {
+			SendToUser(chatID, userHUID, "Спасибо! Теперь вы можете использовать бот.")
+			SendButtonsToUser(chatID, userHUID)
 		}
-		msg += "\nУточните: /add_by_huid <HUID>"
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		return
+	}
+	
+	if command == "/consent_no" {
+		log.Printf("📝 Пользователь %s отказался", userName)
+		SetUserConsent(userHUID, userName, 0)
+		SendConsentDeniedMessage(chatID, userHUID)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		return
+	}
+
+	// Проверка согласия
+	consentStatus, _ := GetUserConsent(userHUID)
+	if consentStatus != 1 {
+		log.Printf("🔒 Пользователь %s не дал согласия", userHUID)
+		SendConsentRequest(chatID, userHUID)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		return
+	}
+
+	// Проверка прав администратора
+	isAdmin, err := IsChatAdmin(chatID, userHUID)
+	if err != nil {
+		log.Printf("⚠️ Ошибка проверки прав: %v", err)
+		isAdmin = false
+	}
+
+	// Обработка кнопок статуса
+	statusMap := map[string]int{"0": 0, "1": 1, "2": 2, "3": 3}
+	if status, ok := statusMap[command]; ok {
+		userInfo, _ := GetUserInfo(userHUID)
+		phone := ""
+		if userInfo != nil && len(userInfo.Emails) > 0 {
+			phone = userInfo.Emails[0]
+		}
+
+		SetStatus(status, userHUID, userName, phone)
+		now := time.Now().Format("02/01/2006 15:04:05")
+
+		var msg string
+		switch status {
+		case 0:
+			msg = fmt.Sprintf("*Статус: 0 - Ключ на ресепшене, ДЗ на охране*\n\nУстановил: %s\nВремя: %s", userName, now)
+			AddHistory(0, userHUID, userName, phone, fmt.Sprintf("%s: Ключ на ресепшене, ДЗ на охране. Установил %s", now, userName))
+		case 1:
+			msg = fmt.Sprintf("*Статус: 1 - Ключ на ресепшене, ДЗ не на охране*\n\nИнициатор: %s\nТелефон: %s\nВремя: %s", userName, phone, now)
+			AddHistory(1, userHUID, userName, phone, fmt.Sprintf("%s: Ключ на ресепшене, ДЗ не на охране. Установил %s по телефону: `%s`", now, userName, phone))
+		case 2:
+			msg = fmt.Sprintf("*Статус: 2 - ДЗ закрыт на ключ*\n\nКлюч у: %s\nТелефон: `%s`\nВремя: %s", userName, phone, now)
+			AddHistory(2, userHUID, userName, phone, fmt.Sprintf("%s: ДЗ закрыт на ключ, ключ у %s. Телефон: `%s`", now, userName, phone))
+		case 3:
+			msg = fmt.Sprintf("*Статус: 3 - ДЗ открыт, ключ у меня*\n\nКлюч у: %s\nТелефон: `%s`\nВремя: %s", userName, phone, now)
+			AddHistory(3, userHUID, userName, phone, fmt.Sprintf("%s: ДЗ открыт, ключ у %s. Телефон: `%s`", now, userName, phone))
+		}
+		
 		SendToUser(chatID, userHUID, msg)
+		SendButtonsToUser(chatID, userHUID)
+		
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 		return
-	    }
-
-	    targetUser := users[0]
-
-	    isMember, err := IsUserInGroup(chatID, targetUser.UserHUID)
-	    if err != nil {
-		SendToUser(chatID, userHUID, fmt.Sprintf("❌ Ошибка проверки: %v", err))
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-		return
-	    }
-
-	    if isMember {
-		SendToUser(chatID, userHUID, fmt.Sprintf("⚠️ %s уже в группе", targetUser.Name))
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-		return
-	    }
-
-	    err = AddUserToGroup(chatID, targetUser.UserHUID)
-	    if err != nil {
-		SendToUser(chatID, userHUID, fmt.Sprintf("❌ Ошибка добавления: %v", err))
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-		return
-	    }
-
-	    SendToUser(chatID, userHUID, fmt.Sprintf("✅ %s добавлен в группу", targetUser.Name))
-	    SendToUser(chatID, targetUser.UserHUID, fmt.Sprintf("Вас добавили в группу DMZ Key Room!\n\nДобавил: %s\n\nИспользуйте кнопки для управления статусом ключа.", userName))
-	    
-	    w.Header().Set("Content-Type", "application/json")
-	    json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-	    return
 	}
 
-	// /add_by_huid <HUID>
-	if strings.HasPrefix(command, "/add_by_huid ") {
-	    targetHUID := strings.TrimPrefix(command, "/add_by_huid ")
-	    targetHUID = strings.TrimSpace(targetHUID)
+	// Административные команды
+	if isAdmin {
+		if strings.HasPrefix(command, "/add ") {
+			fullName := strings.TrimPrefix(command, "/add ")
+			fullName = strings.TrimSpace(fullName)
 
-	    _, err := uuid.Parse(targetHUID)
-	    if err != nil {
-		SendToUser(chatID, userHUID, "Неверный формат HUID")
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-		return
-	    }
+			if fullName == "" {
+				SendToUser(chatID, userHUID, "Формат: /add <Фамилия Имя Отчество>")
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+				return
+			}
 
-	    userInfo, err := GetUserInfo(targetHUID)
-	    if err != nil {
-		SendToUser(chatID, userHUID, fmt.Sprintf("Пользователь не найден: %v", err))
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-		return
-	    }
+			users, err := SearchUserByName(fullName)
+			if err != nil {
+				SendToUser(chatID, userHUID, fmt.Sprintf("Ошибка поиска: %v", err))
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+				return
+			}
 
-	    isMember, err := IsUserInGroup(chatID, targetHUID)
-	    if err != nil {
-		SendToUser(chatID, userHUID, fmt.Sprintf("Ошибка: %v", err))
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-		return
-	    }
+			if len(users) == 0 {
+				SendToUser(chatID, userHUID, fmt.Sprintf("❌ Пользователь \"%s\" не найден", fullName))
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+				return
+			}
 
-	    if isMember {
-		SendToUser(chatID, userHUID, fmt.Sprintf("%s уже в группе", userInfo.Name))
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-		return
-	    }
+			if len(users) > 1 {
+				msg := fmt.Sprintf("Найдено несколько пользователей с именем \"%s\":\n\n", fullName)
+				for i, u := range users {
+					msg += fmt.Sprintf("%d. %s (HUID: %s)\n", i+1, u.Name, u.UserHUID)
+				}
+				msg += "\nУточните: /add_by_huid <HUID>"
+				SendToUser(chatID, userHUID, msg)
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+				return
+			}
 
-	    err = AddUserToGroup(chatID, targetHUID)
-	    if err != nil {
-		SendToUser(chatID, userHUID, fmt.Sprintf("Ошибка: %v", err))
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-		return
-	    }
+			targetUser := users[0]
+			isMember, _ := IsUserInGroup(chatID, targetUser.UserHUID)
+			if isMember {
+				SendToUser(chatID, userHUID, fmt.Sprintf("⚠️ %s уже в группе", targetUser.Name))
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+				return
+			}
 
-	    SendToUser(chatID, userHUID, fmt.Sprintf("%s добавлен в группу", userInfo.Name))
-	    SendToUser(chatID, targetHUID, fmt.Sprintf("Вас добавили в группу DMZ Key Room!\n\n👤 Добавил: %s", userName))
-	    
-	    w.Header().Set("Content-Type", "application/json")
-	    json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-	    return
+			if err := AddUserToGroup(chatID, targetUser.UserHUID); err != nil {
+				SendToUser(chatID, userHUID, fmt.Sprintf("❌ Ошибка добавления: %v", err))
+			} else {
+				SendToUser(chatID, userHUID, fmt.Sprintf("✅ %s добавлен в группу", targetUser.Name))
+				SendToUser(chatID, targetUser.UserHUID, fmt.Sprintf("Вас добавили в группу DMZ Key Room!\n\nДобавил: %s", userName))
+			}
+			
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+			return
+		}
+
+		if strings.HasPrefix(command, "/add_by_huid ") {
+			targetHUID := strings.TrimPrefix(command, "/add_by_huid ")
+			targetHUID = strings.TrimSpace(targetHUID)
+
+			if _, err := uuid.Parse(targetHUID); err != nil {
+				SendToUser(chatID, userHUID, "Неверный формат HUID")
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+				return
+			}
+
+			userInfo, err := GetUserInfo(targetHUID)
+			if err != nil {
+				SendToUser(chatID, userHUID, fmt.Sprintf("Пользователь не найден: %v", err))
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+				return
+			}
+
+			isMember, _ := IsUserInGroup(chatID, targetHUID)
+			if isMember {
+				SendToUser(chatID, userHUID, fmt.Sprintf("%s уже в группе", userInfo.Name))
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+				return
+			}
+
+			if err := AddUserToGroup(chatID, targetHUID); err != nil {
+				SendToUser(chatID, userHUID, fmt.Sprintf("Ошибка: %v", err))
+			} else {
+				SendToUser(chatID, userHUID, fmt.Sprintf("%s добавлен в группу", userInfo.Name))
+				SendToUser(chatID, targetHUID, fmt.Sprintf("Вас добавили в группу DMZ Key Room!\n\n👤 Добавил: %s", userName))
+			}
+			
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+			return
+		}
 	}
-    }
 
-    // Обычные команды
-    switch command {
-    case "/status":
-	status, datechange := GetStatus()
-	var statusText string
-	switch status {
-	case 0:
-	    statusText = "0 - Ключ на ресепшене, ДЗ на охране"
-	case 1:
-	    statusText = "1 - Ключ на ресепшене, ДЗ не на охране"
-	case 2:
-	    statusText = "2 - ДЗ закрыт на ключ"
-	case 3:
-	    statusText = "3 - ДЗ открыт, ключ у меня"
-	default:
-	    statusText = "не определен"
-	}
-	msg := fmt.Sprintf("*Текущий статус ключа:*\n%s\n\nПоследнее изменение: %s", statusText, datechange.Format("02/01/2006 15:04:05"))
-	SendToUser(chatID, userHUID, msg)
+	// Обычные команды
+	switch command {
+	case "/status":
+		status, datechange := GetStatus()
+		statusText := map[int]string{
+			0: "0 - Ключ на ресепшене, ДЗ на охране",
+			1: "1 - Ключ на ресепшене, ДЗ не на охране",
+			2: "2 - ДЗ закрыт на ключ",
+			3: "3 - ДЗ открыт, ключ у меня",
+		}[status]
+		if statusText == "" {
+			statusText = "не определен"
+		}
+		msg := fmt.Sprintf("*Текущий статус ключа:*\n%s\n\nПоследнее изменение: %s", 
+			statusText, datechange.Format("02/01/2006 15:04:05"))
+		SendToUser(chatID, userHUID, msg)
 
-    case "/history":
-	history, err := GetHistory()
-	if err != nil || len(history) == 0 {
-	    SendToUser(chatID, userHUID, "История пуста")
-	} else {
-	    msg := "*История изменения статуса ключа:*\n\n"
-	    for _, h := range history {
-		msg += fmt.Sprintf("%s\n", h["message"])
-	    }
-	    SendToUser(chatID, userHUID, msg)
-	}
+	case "/history":
+		history, err := GetHistory()
+		if err != nil || len(history) == 0 {
+			SendToUser(chatID, userHUID, "История пуста")
+		} else {
+			msg := "*История изменения статуса ключа:*\n\n"
+			for _, h := range history {
+				msg += fmt.Sprintf("%s\n", h["message"])
+			}
+			SendToUser(chatID, userHUID, msg)
+		}
 
-    case "/help":
-	helpText := `0 - Ключ на ресепшене, ДЗ на охране
+	case "/help":
+		helpText := `*Справка по управлению ключом демозала*
+
+*Кнопки статуса:*
+0 - Ключ на ресепшене, ДЗ на охране
 1 - Ключ на ресепшене, ДЗ не на охране
 2 - ДЗ закрыт на ключ
 3 - ДЗ открыт, ключ у меня
-/status - показать статус
-/history - история статуса ключа
-/help - показать справку
+
+*Команды:*
+/status - показать текущий статус
+/history - история изменения статуса
+/help - показать эту справку
+
+*Для администраторов чата:*
+/add <ФИО> - добавить пользователя по имени
+/add_by_huid <HUID> - добавить пользователя по HUID
 
 [Позвонить](tel:+79262292310) - телефон для снятия с охраны демозала`
-	SendToUser(chatID, userHUID, helpText)
+		SendToUser(chatID, userHUID, helpText)
+	}
 
-    default:
-	// Игнорируем неизвестные команды
-    }
-
-    w.Header().Set("Content-Type", "application/json")
-    json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
-
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
@@ -1066,40 +1093,33 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func startStatusResetter() {
-    go func() {
+	go func() {
 		for {
-			// Вычисляем время до следующего 23:59
 			now := time.Now()
 			next := time.Date(now.Year(), now.Month(), now.Day(), 23, 59, 0, 0, now.Location())
 			
-			// Если уже прошло 23:59 сегодня, ставим на завтра
 			if now.After(next) {
 				next = next.Add(24 * time.Hour)
 			}
 			
 			waitDuration := next.Sub(now)
-			log.Printf("Следующий сброс статуса в: %s (через %s)", next.Format("15:04:05"), waitDuration)
-			
-			// Ждем до 23:59
+			log.Printf("⏰ Следующий сброс статуса в: %s (через %s)", next.Format("15:04:05"), waitDuration)
 			time.Sleep(waitDuration)
 			
-			// Сбрасываем статус на 0
-			log.Println("Автоматический сброс статуса на 0 (23:59)")
-			
+			log.Println("🔄 Автоматический сброс статуса на 0 (23:59)")
 			nowTime := time.Now().Format("02/01/2006 15:04:05")
 			SetStatus(0, "system", "Система", "")
 			AddHistory(0, "system", "Система", "", fmt.Sprintf("%s: Автоматический сброс статуса на 0 (ночной сброс)", nowTime))
-			
-			log.Println("Статус сброшен на 0")
+			log.Println("✅ Статус сброшен на 0")
 		}
-    }()
+	}()
 }
 
 // ============= MAIN =============
 
 func main() {
 	if err := godotenv.Load(); err != nil {
-		log.Println("⚠️ .env файл не найден")
+		log.Println("⚠️ .env файл не найден, используем переменные окружения")
 	}
 
 	config = Config{
@@ -1109,17 +1129,25 @@ func main() {
 		ChatID:        os.Getenv("CHAT_ID"),
 		WebhookPort:   os.Getenv("WEBHOOK_PORT"),
 		DBPath:        os.Getenv("DB_PATH"),
+		CertFile:      os.Getenv("CERT_FILE"),
+		KeyFile:       os.Getenv("KEY_FILE"),
 	}
 
 	if config.WebhookPort == "" {
-		config.WebhookPort = "8080"
+		config.WebhookPort = "443"
 	}
 	if config.DBPath == "" {
 		config.DBPath = "dmzkeyroom.db"
 	}
+	if config.CertFile == "" {
+		config.CertFile = "cert.pem"
+	}
+	if config.KeyFile == "" {
+		config.KeyFile = "key.pem"
+	}
 
 	if config.ExpressDomain == "" || config.BotID == "" || config.SecretKey == "" || config.ChatID == "" {
-		log.Fatal("❌ Проверьте .env файл")
+		log.Fatal("❌ Проверьте .env файл: EXPRESS_DOMAIN, BOT_ID, SECRET_KEY, CHAT_ID должны быть заданы")
 	}
 
 	fmt.Println("\n" + strings.Repeat("=", 60))
@@ -1128,43 +1156,57 @@ func main() {
 	fmt.Printf("Express:   %s\n", config.ExpressDomain)
 	fmt.Printf("Bot ID:    %s\n", config.BotID)
 	fmt.Printf("Chat ID:   %s\n", config.ChatID)
-	fmt.Printf("Порт:      %s\n", config.WebhookPort)
+	fmt.Printf("Порт:      %s (HTTPS)\n", config.WebhookPort)
+	fmt.Printf("Сертификат: %s\n", config.CertFile)
+	fmt.Printf("Ключ:      %s\n", config.KeyFile)
 	fmt.Printf("База:      %s\n", config.DBPath)
 	fmt.Println(strings.Repeat("=", 60) + "\n")
 
 	if err := initDB(); err != nil {
-		log.Fatalf("Ошибка инициализации БД: %v", err)
+		log.Fatalf("❌ Ошибка инициализации БД: %v", err)
 	}
 	defer db.Close()
 
-	//startTokenRefresher()
+	startTokenRefresher()
 	startStatusResetter()
+	
 	if _, err := GetToken(); err != nil {
-		log.Fatalf("Не удалось получить токен: %v", err)
+		log.Fatalf("❌ Не удалось получить токен: %v", err)
 	}
-	log.Println("Токен получен")
+	log.Println("✅ Токен получен")
 
-	log.Println("Отправка кнопок в чат...")
-	if err := SendButtons(config.ChatID); err != nil {
-		log.Printf("Ошибка: %v", err)
+	// Получаем список участников
+	if huids, err := GetAllUserHUIDs(config.ChatID); err != nil {
+		log.Printf("⚠️ Ошибка получения участников: %v", err)
 	} else {
-		log.Println("Кнопки отправлены!")
+		log.Printf("📊 Найдено участников в чате: %d", len(huids))
+	}
+
+	// Отправляем кнопки
+	log.Println("📨 Отправка кнопок в чат...")
+	if err := SendButtons(config.ChatID); err != nil {
+		log.Printf("❌ Ошибка отправки кнопок: %v", err)
+	} else {
+		log.Println("✅ Кнопки отправлены!")
 	}
 
 	http.HandleFunc("/", webhookHandler)
 	http.HandleFunc("/health", healthHandler)
 
-	log.Printf("Сервер запущен на порту %s", config.WebhookPort)
-	log.Println("Ожидание команд...\n")
+	log.Printf("🚀 Сервер запущен на порту %s (HTTPS)", config.WebhookPort)
+	log.Println("💡 Убедитесь, что файлы сертификатов существуют:")
+	log.Printf("   - %s", config.CertFile)
+	log.Printf("   - %s", config.KeyFile)
+	log.Println("📡 Ожидание вебхуков от Express...\n")
 
-	// Запуск сервера (можно выбрать HTTP или HTTPS)
-	// Для HTTPS с валидным сертификатом:
-	 if err := http.ListenAndServeTLS(":"+config.WebhookPort, "cert.pem", "key.pem", nil); err != nil {
-	     log.Fatal("Ошибка:", err)
-	 }
-	
-	// Для HTTP (только разработка):
-//	if err := http.ListenAndServe(":"+config.WebhookPort, nil); err != nil {
-///		log.Fatal("Ошибка:", err)
-	//}
+	// Запуск HTTPS сервера
+	/*if err := http.ListenAndServeTLS(":"+config.WebhookPort, config.CertFile, config.KeyFile, nil); err != nil {
+		log.Fatalf("❌ Ошибка запуска HTTPS сервера: %v", err)
+	}*/
+	if err := http.ListenAndServeTLS(":"+config.WebhookPort, 
+    "server.crt",      // файл сертификата
+    "dmz_key_bot.key", // файл приватного ключа
+    nil); err != nil {
+    log.Fatalf("❌ Ошибка запуска HTTPS сервера: %v", err)
+}
 }
