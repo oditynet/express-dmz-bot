@@ -22,6 +22,10 @@
 
  <a href="https://docs.express.ms/smartapps/developer-guide/development-debugging/" >Документация backend и frontend читаем</a>
 
+### Профит которого нет в интернете
+
+Мы долго бились чтоб подружить express c ботом по 443 порту. Да, пробелма была в сертификатах и express не доверял  сертификату бота. Рабочий вариант. Ваш СА центр заверяет сертификат бота и на сервере express СА закидывать надо не в docker, ни в /etc/ а через GUI.
+<a href="https://github.com/oditynet/express-dmz-bot/blob/main/res3.png)/" >Фото места в GUI</a>
 
 Перед запуском заполняем файл
 
