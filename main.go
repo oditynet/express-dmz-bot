@@ -1,4 +1,4 @@
-//version 0.5 beta
+//version 0.6 beta
 
 package main
 
@@ -21,6 +21,7 @@ import (
 	"time"
 	"crypto/x509"
         "encoding/pem"
+        "encoding/base64"
 
 	"github.com/google/uuid"
 	"github.com/joho/godotenv"
@@ -92,26 +93,29 @@ type ChatInfo struct {
 }
 
 type WebhookRequest struct {
-	Command struct {
-		Body     string                 `json:"body"`
-		Data     map[string]interface{} `json:"data"`
-		Metadata map[string]interface{} `json:"metadata"`
-	} `json:"command"`
-	From struct {
-		UserHUID    string `json:"user_huid"`
-		Username    string `json:"username"`
-		Name        string `json:"name"`
-		GroupChatID string `json:"group_chat_id"`
-		ChatType    string `json:"chat_type"`
-		AdLogin     string `json:"ad_login"`
-		AdDomain    string `json:"ad_domain"`
-		IsAdmin     bool   `json:"is_admin"`
-		IsCreator   bool   `json:"is_creator"`
-	} `json:"from"`
-	BotID        string `json:"bot_id"`
-	SyncID       string `json:"sync_id"`
-	ProtoVersion int    `json:"proto_version"`
-	SourceSyncID string `json:"source_sync_id"`
+    Command struct {
+	Body     string                 `json:"body"`
+	Data     map[string]interface{} `json:"data"`
+	Metadata map[string]interface{} `json:"metadata"`
+    } `json:"command"`
+    From struct {
+	UserHUID    string `json:"user_huid"`
+	Username    string `json:"username"`
+	Name        string `json:"name"`
+	GroupChatID string `json:"group_chat_id"`
+	ChatType    string `json:"chat_type"`
+	AdLogin     string `json:"ad_login"`
+	AdDomain    string `json:"ad_domain"`
+	IsAdmin     bool   `json:"is_admin"`
+	IsCreator   bool   `json:"is_creator"`
+    } `json:"from"`
+    BotID        string                   `json:"bot_id"`
+    SyncID       string                   `json:"sync_id"`
+    ProtoVersion int                      `json:"proto_version"`
+    SourceSyncID interface{}              `json:"source_sync_id"`
+    Entities     []interface{}            `json:"entities,omitempty"`
+    Attachments  []map[string]interface{} `json:"attachments,omitempty"`
+    AsyncFiles   []interface{}            `json:"async_files,omitempty"`
 }
 
 // ============= ТОКЕН =============
@@ -122,6 +126,130 @@ type TokenManager struct {
 }
 
 var tokenManager = &TokenManager{}
+
+
+/*func downloadFile(fileID string) ([]byte, error) {
+    token, err := GetToken()
+    if err != nil {
+	return nil, err
+    }
+    
+    url := fmt.Sprintf("%s/api/v3/botx/files/%s", config.ExpressDomain, fileID)
+    req, _ := http.NewRequest("GET", url, nil)
+    req.Header.Set("Authorization", "Bearer "+token)
+    
+    client := &http.Client{Timeout: 30 * time.Second}
+    resp, err := client.Do(req)
+    if err != nil {
+	return nil, err
+    }
+    defer resp.Body.Close()
+    
+    return io.ReadAll(resp.Body)
+}
+func processUserList(chatID, adminHUID string, fileData []byte) {
+    lines := strings.Split(string(fileData), "\n")
+    var successCount, failCount int
+    var failedUsers []string
+    
+    for _, line := range lines {
+	line = strings.TrimSpace(line)
+	if line == "" {
+	    continue
+	}
+	
+	// Ищем пользователя по ФИО
+	users, err := SearchUserByName(line)
+	if err != nil || len(users) == 0 {
+	    log.Printf("Пользователь не найден: %s", line)
+	    failCount++
+	    failedUsers = append(failedUsers, line)
+	    continue
+	}
+	
+	targetUser := users[0]
+	
+	// Проверяем, в группе ли уже
+	isMember, _ := IsUserInGroup(chatID, targetUser.UserHUID)
+	if isMember {
+	    log.Printf("Пользователь уже в группе: %s", line)
+	    successCount++
+	    continue
+	}
+	
+	// Добавляем в группу
+	err = AddUserToGroup(chatID, targetUser.UserHUID)
+	if err != nil {
+	    log.Printf("Ошибка добавления %s: %v", line, err)
+	    failCount++
+	    failedUsers = append(failedUsers, fmt.Sprintf("%s (ошибка: %v)", line, err))
+	    continue
+	}
+	
+	// Отправляем уведомление пользователю
+	SendToUser(chatID, targetUser.UserHUID, fmt.Sprintf("Вас добавили в группу DMZ Key Room!\n\nДобавил: %s", adminHUID))
+	
+	successCount++
+	time.Sleep(500 * time.Millisecond)
+    }
+    
+    // Отчет администратору
+    report := fmt.Sprintf("✅ Обработка списка пользователей завершена\n\n✅ Успешно добавлено: %d\n❌ Не найдено/ошибок: %d", successCount, failCount)
+    
+    if len(failedUsers) > 0 && len(failedUsers) <= 10 {
+	report += "\n\nНе добавлены:\n"
+	for _, name := range failedUsers {
+	    report += fmt.Sprintf("- %s\n", name)
+	}
+    } else if len(failedUsers) > 10 {
+	report += fmt.Sprintf("\n\nИ еще %d пользователей не добавлено (список в логах)", len(failedUsers)-10)
+    }
+    
+    SendToUser(chatID, adminHUID, report)
+}*/
+func handleFileUpload(chatID, userHUID, fileName, content string) {
+    // Декодируем base64
+    decoded, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(content, "data:text/plain;base64,"))
+    if err != nil {
+        SendToUser(chatID, userHUID, fmt.Sprintf("Ошибка декодирования файла: %v", err))
+        return
+    }
+    
+    // Разбираем строки с ФИО
+    lines := strings.Split(string(decoded), "\n")
+    addedCount := 0
+    notFoundCount := 0
+    
+    for _, line := range lines {
+        line = strings.TrimSpace(line)
+        if line == "" {
+            continue
+        }
+        
+        users, err := SearchUserByName(line)
+        if err != nil || len(users) == 0 {
+            notFoundCount++
+            continue
+        }
+        
+        // Берем первого найденного
+        targetUser := users[0]
+        
+        // Проверяем, не в группе ли уже
+        isMember, _ := IsUserInGroup(chatID, targetUser.UserHUID)
+        if isMember {
+            continue
+        }
+        
+        if err := AddUserToGroup(chatID, targetUser.UserHUID); err == nil {
+            addedCount++
+            SendToUser(chatID, targetUser.UserHUID, fmt.Sprintf("Вас добавили в группу DMZ Key Room!"))
+        }
+    }
+    
+    msg := fmt.Sprintf("Обработка файла %s завершена:\nДобавлено: %d\nНе найдено: %d", fileName, addedCount, notFoundCount)
+    SendToUser(chatID, userHUID, msg)
+}
 
 func generateSignature(botID, secretKey string) string {
 	h := hmac.New(sha256.New, []byte(secretKey))
@@ -876,51 +1004,127 @@ func startCertificateChecker() {
         }
     }()
 }
+/*func DeleteMessage(chatID, syncID string) error {
+    token, err := GetToken()
+    if err != nil {
+	return err
+    }
+
+    // Правильный endpoint по документации
+    url := fmt.Sprintf("%s/api/v4/botx/chats/%s/messages/%s", 
+	config.ExpressDomain, chatID, syncID)
+    
+    log.Printf("Удаление сообщения: %s", url)
+    
+    req, err := http.NewRequest("DELETE", url, nil)
+    if err != nil {
+	return err
+    }
+    req.Header.Set("Authorization", "Bearer "+token)
+
+    client := &http.Client{Timeout: 10 * time.Second}
+    resp, err := client.Do(req)
+    if err != nil {
+	return err
+    }
+    defer resp.Body.Close()
+
+    body, _ := io.ReadAll(resp.Body)
+    log.Printf("Ответ на удаление: %s", string(body))
+    log.Printf("Статус удаления: %d", resp.StatusCode)
+
+    // Успешное удаление обычно возвращает 200 OK или 204 No Content
+    if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNoContent {
+	log.Printf("Сообщение %s успешно удалено", syncID)
+	return nil
+    }
+
+    return fmt.Errorf("failed to delete message, status: %d, body: %s", resp.StatusCode, string(body))
+}
+*/
+func HideMessage(syncID string) error {
+    token, err := GetToken()
+    if err != nil {
+        return err
+    }
+
+    payload := map[string]interface{}{
+        "sync_id": syncID,
+        "payload": map[string]interface{}{
+            "body":        "Файл обработан и скрыт",
+            "attachments": []interface{}{},
+        },
+    }
+
+    jsonData, _ := json.Marshal(payload)
+    url := fmt.Sprintf("%s/api/v3/botx/events/edit_event", config.ExpressDomain)
+    
+    req, _ := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+    req.Header.Set("Content-Type", "application/json")
+    req.Header.Set("Authorization", "Bearer "+token)
+
+    client := &http.Client{Timeout: 10 * time.Second}
+    resp, err := client.Do(req)
+    if err != nil {
+        return err
+    }
+    defer resp.Body.Close()
+
+    return nil
+}
 
 // ============= ОБРАБОТЧИКИ =============
 func webhookHandler(w http.ResponseWriter, r *http.Request) {
-	log.Printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-	log.Printf("Получен запрос: %s %s", r.Method, r.URL.Path)
+    log.Printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    log.Printf("Получен запрос: %s %s", r.Method, r.URL.Path)
 
-	if r.Method == "GET" {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-		return
-	}
+    if r.Method == "GET" {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	return
+    }
 
-	if r.Method != "POST" {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
+    if r.Method != "POST" {
+	http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	return
+    }
 
-	bodyBytes, err := io.ReadAll(r.Body)
-	if err != nil {
-		log.Printf("Ошибка чтения тела: %v", err)
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{"status": "error"})
-		return
-	}
-	
-	//log.Printf("ПОЛНЫЙ JSON ЗАПРОСА:")
-        //log.Printf("%s", string(bodyBytes))
-	
-	r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+    bodyBytes, err := io.ReadAll(r.Body)
+    if err != nil {
+	log.Printf("Ошибка чтения тела: %v", err)
+	w.WriteHeader(http.StatusBadRequest)
+	json.NewEncoder(w).Encode(map[string]string{"status": "error"})
+	return
+    }
+    
+//    log.Printf("ПОЛНЫЙ JSON ЗАПРОСА:")
+//    log.Printf("%s", string(bodyBytes))
+    
+    r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
 
-	var data WebhookRequest
-	if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
-		log.Printf("Ошибка декодирования: %v", err)
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{"status": "error"})
-		return
-	}
-	if data.Command.Body == "system:added_to_chat" {
+    var data WebhookRequest
+    if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
+	log.Printf("Ошибка декодирования: %v", err)
+	w.WriteHeader(http.StatusBadRequest)
+	json.NewEncoder(w).Encode(map[string]string{"status": "error"})
+	return
+    }
+    
+    // ========== ОБЪЯВЛЯЕМ ПЕРЕМЕННЫЕ ==========
+    command := data.Command.Body
+    userHUID := data.From.UserHUID
+    userName := data.From.Username
+    if userName == "" {
+	userName = data.From.Name
+    }
+    chatID := data.From.GroupChatID
+    // ========================================
+    
+    // Обработка события добавления в чат
+    if command == "system:added_to_chat" {
 	log.Printf("Событие: добавление пользователя в чат")
 	
-	// Получаем список добавленных пользователей
-	chatID := data.From.GroupChatID
-	
-	// Из data.Command.Data получаем added_members
 	var addedMembers []string
 	if added, ok := data.Command.Data["added_members"].([]interface{}); ok {
 	    for _, m := range added {
@@ -930,11 +1134,9 @@ func webhookHandler(w http.ResponseWriter, r *http.Request) {
 	    }
 	}
 	
-	log.Printf("Добавленные пользователи: %v", addedMembers)
+//	log.Printf("Добавленные пользователи: %v", addedMembers)
 	
-	// Отправляем каждому новому пользователю запрос согласия
 	for _, userHUID := range addedMembers {
-	    // Получаем имя пользователя
 	    userInfo, err := GetUserInfo(userHUID)
 	    userName := userHUID
 	    if err == nil && userInfo != nil {
@@ -942,36 +1144,61 @@ func webhookHandler(w http.ResponseWriter, r *http.Request) {
 	    }
 	    
 	    log.Printf("Отправка согласия пользователю: %s (%s)", userName, userHUID)
-	    
-	    // Отправляем приветствие
 	    SendToUser(chatID, userHUID, fmt.Sprintf("Добро пожаловать, %s!", userName))
-	    
-	    // Отправляем запрос согласия
-	    SendConsentRequest(chatID, userHUID)
+	//    SendConsentRequest(chatID, userHUID)
 	}
 	
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	return
     }
-
-	if data.Command.Body == "" || data.From.UserHUID == "" {
-		log.Printf("Пропускаем callback запрос")
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-		return
-	}
-
-	command := data.Command.Body
-	userHUID := data.From.UserHUID
-	userName := data.From.Username
-	if userName == "" {
-		userName = data.From.Name
-	}
-	chatID := data.From.GroupChatID
+    
+    // ========== ОБРАБОТКА ФАЙЛОВ (после объявления переменных) ==========
+    if len(data.Attachments) > 0 {
+	log.Printf("Получен файл от %s", userName)
+	//syncID := data.SyncID 
 	
-        //log.Printf("[ЧАТ %s] %s (%s): %s", chatID, userName, userHUID, command)
+	for _, att := range data.Attachments {
+	    attType, _ := att["type"].(string)
+	    if attType == "document" {
+		attData, ok := att["data"].(map[string]interface{})
+		if !ok {
+		    continue
+		}
+		fileName, _ := attData["file_name"].(string)
+		content, _ := attData["content"].(string)
+		
+		//log.Printf("Файл: %s, размер: %d", fileName, len(content))
+		
+		go handleFileUpload(chatID, userHUID, fileName, content)
+		
+		SendToUser(chatID, userHUID, fmt.Sprintf("Получен файл: %s, начата обработка", fileName))
+		/*if err := DeleteMessage(chatID, syncID); err != nil {
+	    	    log.Printf("Ошибка удаления сообщения с файлом: %v", err)
+		} else {
+		    log.Printf("Сообщение с файлом %s удалено из чата", fileName)
+		}*/
+		 // Скрываем сообщение с файлом
+            /*if err := HideMessage(syncID); err != nil {
+                log.Printf("Ошибка скрытия сообщения: %v", err)
+            } else {
+                log.Printf("Сообщение с файлом %s скрыто", fileName)
+            }*/
+	    }
+	}
 	
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	return
+    }
+    // ====================================================================
+
+    if command == "" || userHUID == "" {
+	log.Printf("Пропускаем callback запрос")
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	return
+    }	
 
 	//log.Printf("Команда: '%s' от %s (%s) в чате %s", command, userName, userHUID, chatID)
 
@@ -1146,7 +1373,13 @@ func webhookHandler(w http.ResponseWriter, r *http.Request) {
 			json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 			return
 		}
-	}
+	}else if strings.HasPrefix(command, "/add ") || strings.HasPrefix(command, "/add_by_huid ") {
+    // Если команда админская, но пользователь не админ
+    SendToUser(chatID, userHUID, "У вас нет прав администратора для выполнения этой команды.")
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+    return
+}
 
 	switch command {
 	case "/status":
