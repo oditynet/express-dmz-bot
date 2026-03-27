@@ -1,4 +1,4 @@
-//version 0.6 beta
+//version 0.5 beta
 
 package main
 
@@ -128,85 +128,6 @@ type TokenManager struct {
 var tokenManager = &TokenManager{}
 
 
-/*func downloadFile(fileID string) ([]byte, error) {
-    token, err := GetToken()
-    if err != nil {
-	return nil, err
-    }
-    
-    url := fmt.Sprintf("%s/api/v3/botx/files/%s", config.ExpressDomain, fileID)
-    req, _ := http.NewRequest("GET", url, nil)
-    req.Header.Set("Authorization", "Bearer "+token)
-    
-    client := &http.Client{Timeout: 30 * time.Second}
-    resp, err := client.Do(req)
-    if err != nil {
-	return nil, err
-    }
-    defer resp.Body.Close()
-    
-    return io.ReadAll(resp.Body)
-}
-func processUserList(chatID, adminHUID string, fileData []byte) {
-    lines := strings.Split(string(fileData), "\n")
-    var successCount, failCount int
-    var failedUsers []string
-    
-    for _, line := range lines {
-	line = strings.TrimSpace(line)
-	if line == "" {
-	    continue
-	}
-	
-	// Ищем пользователя по ФИО
-	users, err := SearchUserByName(line)
-	if err != nil || len(users) == 0 {
-	    log.Printf("Пользователь не найден: %s", line)
-	    failCount++
-	    failedUsers = append(failedUsers, line)
-	    continue
-	}
-	
-	targetUser := users[0]
-	
-	// Проверяем, в группе ли уже
-	isMember, _ := IsUserInGroup(chatID, targetUser.UserHUID)
-	if isMember {
-	    log.Printf("Пользователь уже в группе: %s", line)
-	    successCount++
-	    continue
-	}
-	
-	// Добавляем в группу
-	err = AddUserToGroup(chatID, targetUser.UserHUID)
-	if err != nil {
-	    log.Printf("Ошибка добавления %s: %v", line, err)
-	    failCount++
-	    failedUsers = append(failedUsers, fmt.Sprintf("%s (ошибка: %v)", line, err))
-	    continue
-	}
-	
-	// Отправляем уведомление пользователю
-	SendToUser(chatID, targetUser.UserHUID, fmt.Sprintf("Вас добавили в группу DMZ Key Room!\n\nДобавил: %s", adminHUID))
-	
-	successCount++
-	time.Sleep(500 * time.Millisecond)
-    }
-    
-    // Отчет администратору
-    report := fmt.Sprintf("✅ Обработка списка пользователей завершена\n\n✅ Успешно добавлено: %d\n❌ Не найдено/ошибок: %d", successCount, failCount)
-    
-    if len(failedUsers) > 0 && len(failedUsers) <= 10 {
-	report += "\n\nНе добавлены:\n"
-	for _, name := range failedUsers {
-	    report += fmt.Sprintf("- %s\n", name)
-	}
-    } else if len(failedUsers) > 10 {
-	report += fmt.Sprintf("\n\nИ еще %d пользователей не добавлено (список в логах)", len(failedUsers)-10)
-    }
-    
-    SendToUser(chatID, adminHUID, report)
-}*/
 func handleFileUpload(chatID, userHUID, fileName, content string) {
     // Декодируем base64
     decoded, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(content, "data:text/plain;base64,"))
@@ -1145,6 +1066,7 @@ func webhookHandler(w http.ResponseWriter, r *http.Request) {
 	    
 	    log.Printf("Отправка согласия пользователю: %s (%s)", userName, userHUID)
 	    SendToUser(chatID, userHUID, fmt.Sprintf("Добро пожаловать, %s!", userName))
+	    SendButtonsToUser(chatID, userHUID)
 	//    SendConsentRequest(chatID, userHUID)
 	}
 	
@@ -1184,6 +1106,7 @@ func webhookHandler(w http.ResponseWriter, r *http.Request) {
             } else {
                 log.Printf("Сообщение с файлом %s скрыто", fileName)
             }*/
+            
 	    }
 	}
 	
@@ -1254,10 +1177,10 @@ func webhookHandler(w http.ResponseWriter, r *http.Request) {
 		var msg string
 		switch status {
 		case 0:
-			msg = fmt.Sprintf("*Статус: 0 - Ключ на ресепшене, ДЗ на охране*\n\nУстановил: %s\nВремя: %s", userName, now)
-			AddHistory(0, userHUID, userName, phone, fmt.Sprintf("%s: Ключ на ресепшене, ДЗ на охране. Установил %s", now, userName))
+			msg = fmt.Sprintf("*Статус: 0 - Ключ на ресепшене, ДЗ на охране*\n\nУстановил: %s по телефону: %s\nВремя: %s", userName, phone, now)
+			AddHistory(0, userHUID, userName, phone, fmt.Sprintf("%s: Ключ на ресепшене, ДЗ на охране. Установил %s по телефону: %s", now, userName, phone))
 		case 1:
-			msg = fmt.Sprintf("*Статус: 1 - Ключ на ресепшене, ДЗ не на охране*\n\nИнициатор: %s\nТелефон: %s\nВремя: %s", userName, phone, now)
+			msg = fmt.Sprintf("*Статус: 1 - Ключ на ресепшене, ДЗ не на охране*\n\nУстановил: %s по телефону: %s\nВремя: %s", userName, phone, now)
 			AddHistory(1, userHUID, userName, phone, fmt.Sprintf("%s: Ключ на ресепшене, ДЗ не на охране. Установил %s по телефону: %s", now, userName, phone))
 		case 2:
 			msg = fmt.Sprintf("*Статус: 2 - ДЗ закрыт на ключ*\n\nКлюч у: %s\nТелефон: %s\nВремя: %s", userName, phone, now)
@@ -1418,27 +1341,6 @@ func webhookHandler(w http.ResponseWriter, r *http.Request) {
 	    w.Header().Set("Content-Type", "application/json")
 	    json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	    return
-	/*case "/status":
-		status, datechange := GetStatus()
-		statusText := map[int]string{
-			0: "0 - Ключ на ресепшене, ДЗ на охране",
-			1: "1 - Ключ на ресепшене, ДЗ не на охране",
-			2: "2 - ДЗ закрыт на ключ",
-			3: "3 - ДЗ открыт, ключ у меня",
-		}[status]
-		if statusText == "" {
-			statusText = "не определен"
-		}
-		msg := fmt.Sprintf("*Текущий статус ключа:*\n%s\n\nПоследнее изменение: %s",
-			statusText, datechange.Format("02/01/2006 15:04:05"))
-		SendToUser(chatID, userHUID, msg)
-		
-		SendButtonsToUser(chatID, userHUID)
-		w.Header().Set("Content-Type", "application/json")
-	        json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-	        return*/
-	
-
 
 	case "/history":
 		history, err := GetHistory()
