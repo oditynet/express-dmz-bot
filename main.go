@@ -506,7 +506,14 @@ func SendToUser(chatID, userHUID, text string) error {
 		return err
 	}
 
-	log.Printf("Отправка сообщения пользователю %s в чат %s", userHUID, chatID)
+	//log.Printf("Отправка сообщения пользователю %s в чат %s", userHUID, chatID)
+	userName := userHUID
+        userInfo, err := GetUserInfo(userHUID)
+        if err == nil && userInfo != nil {
+            userName = userInfo.Name
+        }
+        log.Printf("Отправка сообщения пользователю %s (%s) в чат %s", userName, userHUID, chatID)
+
 
 	payload := SendRequest{
 		GroupChatID: chatID,
@@ -566,8 +573,14 @@ func SendButtonsToUser(chatID, userHUID string) error {
 	if err != nil {
 		return err
 	}
+	
+	 userName := userHUID
+    userInfo, err := GetUserInfo(userHUID)
+    if err == nil && userInfo != nil {
+        userName = userInfo.Name
+    }
 
-	log.Printf("Отправка кнопок пользователю %s в чат %s", userHUID, chatID)
+	log.Printf("Отправка кнопок пользователю %s (%s) в чат %s", userHUID,userName, chatID)
         buttons := [][]Button{
     {
         {Command: "0", Label: "0", HSize: 3, Opts: map[string]interface{}{"silent": true}},
