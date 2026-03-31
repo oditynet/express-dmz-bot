@@ -1,4 +1,6 @@
-//version 0.5 beta
+//version 0.5.1 beta TODO Err-1  Status = Done
+//                   TODO История сверху вниз и пробел между историей = Done
+//     
 
 package main
 
@@ -331,7 +333,7 @@ func GetStatus() (int, time.Time) {
     var status int
     var datechangeStr string
     err := db.QueryRow("SELECT status, datechange FROM key_status WHERE id = 1").Scan(&status, &datechangeStr)
-    if err != nil {
+    if err != nil { 
 	if err == sql.ErrNoRows {
 	    now := time.Now()
 	    db.Exec("INSERT INTO key_status (id, status, datechange) VALUES (1, 0, ?)", now.Format("2006-01-02 15:04:05"))
@@ -342,7 +344,10 @@ func GetStatus() (int, time.Time) {
     }
     
     // Парсинг даты
-    datechange, err := time.Parse("2006-01-02 15:04:05", datechangeStr)
+    //Err-1
+    //datechange изменяется при просмотре статус
+    //datechange, err := time.Parse("2006-01-02 15:04:05", datechangeStr)
+    datechange, err := time.Parse(time.RFC3339Nano, datechangeStr)
     if err != nil {
 	log.Printf("Ошибка парсинга даты: %v, строка: %s", err, datechangeStr)
 	return status, time.Now()
@@ -381,12 +386,19 @@ func AddHistory(status int, userHUID, userName, phone, message string) {
 }
 
 func GetHistory() ([]map[string]string, error) {
+        //TODO историю выводить сверху - вниз
 	rows, err := db.Query(`
+		SELECT timestamp, status, user_name, phone, message 
+		FROM history 
+		ORDER BY timestamp
+		LIMIT 8
+	`)
+	/*rows, err := db.Query(`
 		SELECT timestamp, status, user_name, phone, message 
 		FROM history 
 		ORDER BY timestamp DESC 
 		LIMIT 8
-	`)
+	`)*/
 	if err != nil {
 		return nil, err
 	}
@@ -1363,6 +1375,8 @@ func webhookHandler(w http.ResponseWriter, r *http.Request) {
 			msg := "*История изменения статуса ключа:*\n\n"
 			for _, h := range history {
 				msg += fmt.Sprintf("%s\n", h["message"])
+				//TODO Пробелы между историей попросили сделать
+				msg += fmt.Sprintf("\n")
 			}
 			SendToUser(chatID, userHUID, msg)
 		}
