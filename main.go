@@ -1,6 +1,6 @@
 //version 0.5.1 beta TODO Err-1  Status = Done
 //                   TODO История сверху вниз и пробел между историей = Done
-//     
+//                   TODO Польз.соглашение в корп. среде излишнее. Отдел кабров все сделал за нас = Done
 
 package main
 
@@ -1170,14 +1170,14 @@ func webhookHandler(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 		return
 	}
-
-	consentStatus, _ := GetUserConsent(userHUID)
+	//TODO-3 соглашение отключаем
+	/*consentStatus, _ := GetUserConsent(userHUID)
 	if consentStatus != 1 {
 		SendConsentRequest(chatID, userHUID)
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 		return
-	}
+	}*/
 
 	isAdmin, _ := IsChatAdmin(chatID, userHUID)
 	log.Printf("isAdmin: %v", isAdmin)
