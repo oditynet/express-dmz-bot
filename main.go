@@ -575,11 +575,12 @@ func SendButtonsToAll(chatID string) error {
 }
 
 func SendButtonsToUser(chatID, userHUID string) error {
-	consentStatus, _ := GetUserConsent(userHUID)
+	//TODO-3 отключаем польз.соглашение
+	/*consentStatus, _ := GetUserConsent(userHUID)
 	if consentStatus != 1 {
 		log.Printf("Пользователь %s не дал согласия, отправляем запрос", userHUID)
 		return SendConsentRequest(chatID, userHUID)
-	}
+	}*/
 
 	token, err := GetToken()
 	if err != nil {
